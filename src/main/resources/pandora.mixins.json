@@ -1,0 +1,15 @@
+{
+	"required": true,
+	"package": "com.garous.pandora.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"mixins": [],
+	"client": [
+		"OverlayMessageMixin",
+		"ChatMessageMixin",
+		"BlockUpdateMixin",
+		"ChunkDeltaUpdateMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

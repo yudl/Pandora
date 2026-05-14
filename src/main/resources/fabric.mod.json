@@ -1,0 +1,34 @@
+{
+	"schemaVersion": 1,
+	"id": "pandora",
+	"version": "${version}",
+	"name": "Pandora",
+	"description": "Pandora B1 - Fabric utility client for Minecraft 1.21.11",
+	"authors": [
+		"Garous"
+	],
+	"contact": {},
+	"license": "CC0-1.0",
+	"icon": "assets/pandora/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.garous.pandora.Pandora"
+		],
+		"client": [
+			"com.garous.pandora.PandoraClient"
+		],
+		"fabric-datagen": [
+			"com.garous.pandora.PandoraDataGenerator"
+		]
+	},
+	"mixins": [
+		"pandora.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.2",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

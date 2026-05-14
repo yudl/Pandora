@@ -37,6 +37,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -60,7 +61,10 @@ public class GTBSolverEngine {
 
     private static final int MAX_DISPLAYED_MATCHES = 100;
     private static final long AUTO_GUESS_INTERVAL_MS = 3_000L;
+    // Scanner re-scoring runs frequently for HUD freshness, but local 'scanner: X'
+    // chat notices are throttled to match the chat cooldown.
     private static final long SCAN_INTERVAL_MS = 750L;
+    private static final long SCANNER_NOTICE_INTERVAL_MS = 3_000L;
     private static final long ROUND_RE_ANCHOR_INTERVAL_MS = 750L;
     private static final long GAME_SIGNAL_GRACE_MS = 30_000L;
     private static final long ROUND_SIGNAL_GRACE_MS = 25_000L;
@@ -142,13 +146,17 @@ public class GTBSolverEngine {
     private String lastThemeLabel = "";
 
     // Scanner state
-    private PlotRegion plotRegion;
-    private final Map<Long, String> baseline = new HashMap<>();
-    private final Map<Long, String> placed = new HashMap<>();
+    // ConcurrentHashMaps because Fabric's BlockUpdate/ChunkDeltaUpdate mixin runs
+    // on the network thread (the @At HEAD injection point fires before
+    // NetworkThreadUtils.forceMainThread reschedules the rest to the main thread).
+    private volatile PlotRegion plotRegion;
+    private final ConcurrentHashMap<Long, String> baseline = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, String> placed = new ConcurrentHashMap<>();
     private long lastScanAt;
     private long lastReanchorAt;
     private String lastScannerGuess = "";
     private String lastScannerTheme = "";
+    private long lastScannerNoticeAt;
     private List<ScoredTheme> lastScannerScores = List.of();
 
     // HUD
@@ -280,30 +288,61 @@ public class GTBSolverEngine {
     }
 
     public void renderGuessHistoryHud(DrawContext context) {
-        int width = 132;
+        int width = 144;
         int headerColor = 0xE014141A;
         int bodyColor = 0xD8101014;
         int accentColor = 0xFFFF4FD8;
         int textColor = 0xFFFFFFFF;
         int mutedColor = 0xFFB7B7C6;
-        int historySize = Math.min(Math.max(guessHistory.size(), 1), 6);
-        int height = 16 + historySize * 10;
+        int hintColor = 0xFFFFD050;
+        int scannerColor = 0xFF7DE38B;
 
+        // Build the lines we want to render, in order, then render them.
+        List<HudLine> lines = new ArrayList<>();
+        lines.add(new HudLine(hudStatus, mutedColor));
+
+        if (!lastRoundLabel.isBlank() || !lastBuilderLabel.isBlank()) {
+            String round = lastRoundLabel.isBlank() ? "?" : lastRoundLabel;
+            String builder = lastBuilderLabel.isBlank() ? "" : " · " + truncate(lastBuilderLabel, 14);
+            lines.add(new HudLine("round " + round + builder, textColor));
+        }
+        if (!lastHint.isBlank()) {
+            lines.add(new HudLine("hint: " + truncate(lastHint, 22), hintColor));
+        }
+        for (int i = 0; i < Math.min(lastScannerScores.size(), 3); i++) {
+            ScoredTheme st = lastScannerScores.get(i);
+            String label = (i == 0 ? "» " : "  ") + truncate(st.theme(), 18);
+            lines.add(new HudLine(label, i == 0 ? scannerColor : mutedColor));
+        }
+        if (!guessHistory.isEmpty()) {
+            lines.add(new HudLine("--- recent ---", 0xFF55555F));
+            int historySize = Math.min(guessHistory.size(), 4);
+            for (int index = 0; index < historySize; index++) {
+                String guess = guessHistory.get(guessHistory.size() - 1 - index);
+                lines.add(new HudLine(truncate(guess, 22), mutedColor));
+            }
+        }
+
+        int height = 16 + lines.size() * 10;
         context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + height, bodyColor);
         context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + 14, headerColor);
         context.fill(HUD_X, HUD_Y, HUD_X + 3, HUD_Y + 14, accentColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb guesses", HUD_X + 6, HUD_Y + 3, textColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudPlacedCount + " blocks", HUD_X + width - 50, HUD_Y + 3, mutedColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb scanner", HUD_X + 6, HUD_Y + 3, textColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudPlacedCount + " blocks", HUD_X + width - 56, HUD_Y + 3, mutedColor);
 
-        if (guessHistory.isEmpty()) {
-            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudStatus, HUD_X + 6, HUD_Y + 18, mutedColor);
-            return;
-        }
-        for (int index = 0; index < historySize; index++) {
-            String guess = guessHistory.get(guessHistory.size() - 1 - index);
-            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, guess, HUD_X + 6, HUD_Y + 18 + index * 10, mutedColor);
+        for (int i = 0; i < lines.size(); i++) {
+            HudLine line = lines.get(i);
+            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, line.text, HUD_X + 6, HUD_Y + 18 + i * 10, line.color);
         }
     }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, Math.max(0, max - 1)) + "…";
+    }
+
+    private record HudLine(String text, int color) {}
 
     public void reset() {
         lastHint = "";
@@ -769,7 +808,11 @@ public class GTBSolverEngine {
             lastScannerGuess = shortestGuess;
             lastScannerTheme = best.theme();
             hudStatus = "scanner: " + shortestGuess;
-            sendScannerSuggestion(best.theme());
+            long now = System.currentTimeMillis();
+            if (now - lastScannerNoticeAt >= SCANNER_NOTICE_INTERVAL_MS) {
+                lastScannerNoticeAt = now;
+                sendScannerSuggestion(best.theme());
+            }
         }
     }
 
@@ -970,8 +1013,12 @@ public class GTBSolverEngine {
         boolean recentBuilder = now - lastBuilderSignalAt < ROUND_SIGNAL_GRACE_MS;
         boolean recentHint = now - lastHintSignalAt < ROUND_SIGNAL_GRACE_MS;
 
-        boolean scoreboardGtb = title.contains("guess the build")
-                || lines.stream().anyMatch(line -> line.contains("guess the build"));
+        // Pre-game lobby detection: server may animate the title with per-character
+        // colors (yellow→orange→white) which strip cleanly to plain text. Also
+        // accept "Mode: Guess The Build" sidebar lines from the main hub, the
+        // bare "GTB" abbreviation, and any line containing both "build" + "guess".
+        boolean scoreboardGtb = mentionsGtb(title)
+                || lines.stream().anyMatch(GTBSolverEngine::mentionsGtb);
         boolean inGuessTheBuild = scoreboardGtb || ((recentRound || recentHint) && recentBuilder)
                 || (recentRound && recentHint);
 
@@ -1056,6 +1103,15 @@ public class GTBSolverEngine {
         return clean(message.substring(start + lp.length()));
     }
 
+    private static boolean mentionsGtb(String text) {
+        if (text == null || text.isEmpty()) return false;
+        if (text.contains("guess the build")) return true;
+        // "GTB" as a standalone token (lowercased earlier so check 'gtb').
+        if (text.matches(".*\\bgtb\\b.*")) return true;
+        // "Mode: Guess..." or "Map: Guess..." style lines that name the game.
+        return text.contains("guess") && text.contains("build");
+    }
+
     private static boolean isWhiteTerracotta(BlockState state) {
         String id = Registries.BLOCK.getId(state.getBlock()).getPath();
         return "white_terracotta".equals(id) || "hardened_clay".equals(id) || "white_stained_hardened_clay".equals(id);
@@ -1120,7 +1176,10 @@ public class GTBSolverEngine {
 
         static BuildFingerprint fromPlaced(Map<Long, String> placed, PlotRegion region) {
             BuildFingerprint fp = new BuildFingerprint(region);
-            for (Map.Entry<Long, String> entry : placed.entrySet()) {
+            // Snapshot the map first; the source map is concurrently mutated from
+            // the network thread when block updates arrive.
+            Map<Long, String> snapshot = new HashMap<>(placed);
+            for (Map.Entry<Long, String> entry : snapshot.entrySet()) {
                 BlockPos pos = BlockPos.fromLong(entry.getKey());
                 fp.add(pos, entry.getValue());
             }

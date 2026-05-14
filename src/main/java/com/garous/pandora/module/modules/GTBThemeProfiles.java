@@ -405,16 +405,19 @@ public final class GTBThemeProfiles {
                 Set.of("sand", "sandstone"),
                 List.of(Shape.SYMMETRIC),
                 15, 0, null));
+        // Pool / swimming pool: require a sizeable build before guessing it -
+        // small water placements (e.g. an island scene starting with a water
+        // floor) shouldn't immediately resolve to "swimming pool".
         map.put("swimming pool", new Profile(
                 Set.of("blue", "cyan", "white"),
                 Set.of("water", "wool", "concrete", "quartz"),
                 List.of(Shape.FLAT, Shape.WIDE),
-                10, 0, null));
+                14, 0, null));
         map.put("pool", new Profile(
                 Set.of("blue", "cyan"),
                 Set.of("water", "wool", "concrete"),
                 List.of(Shape.FLAT),
-                10, 0, null));
+                14, 0, null));
 
         // === Vehicles ===
         map.put("car", new Profile(
@@ -736,6 +739,275 @@ public final class GTBThemeProfiles {
                 Set.of("iron", "quartz", "wool"),
                 List.of(Shape.TALL),
                 10, 0, null));
+
+        // === Things easily confused with each other (helps differentiate) ===
+        // White wool also looks like newspaper, stamp, dollar, paper, milk, ghost...
+        // Adding profiles for these gives the scoring a chance to differentiate.
+        map.put("stamp", new Profile(
+                Set.of("white", "red", "blue", "black"),
+                Set.of("wool", "concrete", "terracotta"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                4, 40, null));
+        map.put("newspaper", new Profile(
+                Set.of("white", "black", "gray"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT),
+                6, 60, null));
+        map.put("paper", new Profile(
+                Set.of("white"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT),
+                4, 40, null));
+        map.put("dollar", new Profile(
+                Set.of("green", "white"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                6, 0, null));
+        map.put("money", new Profile(
+                Set.of("green", "white", "yellow"),
+                Set.of("wool", "concrete", "gold"),
+                List.of(),
+                4, 0, null));
+        map.put("dollar bill", new Profile(
+                Set.of("green", "white"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                6, 0, null));
+        map.put("photo", new Profile(
+                Set.of(),
+                Set.of("wool", "concrete", "glass"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                6, 0, null));
+        map.put("picture", new Profile(
+                Set.of(),
+                Set.of("wool", "concrete", "glass"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                6, 0, null));
+        map.put("frame", new Profile(
+                Set.of("brown", "yellow"),
+                Set.of("wood", "planks", "gold"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                6, 0, null));
+        map.put("island", new Profile(
+                Set.of("yellow", "blue", "green"),
+                Set.of("sand", "water", "grass", "leaves"),
+                List.of(Shape.FLAT),
+                15, 0, null));
+        map.put("river", new Profile(
+                Set.of("blue", "cyan"),
+                Set.of("water"),
+                List.of(Shape.WIDE, Shape.FLAT),
+                6, 0, null));
+        map.put("lake", new Profile(
+                Set.of("blue", "cyan"),
+                Set.of("water"),
+                List.of(Shape.FLAT),
+                10, 0, null));
+        map.put("pond", new Profile(
+                Set.of("blue", "cyan"),
+                Set.of("water"),
+                List.of(Shape.FLAT),
+                4, 30, null));
+        map.put("flag pole", new Profile(
+                Set.of(),
+                Set.of("iron", "wool", "wood"),
+                List.of(Shape.TALL),
+                6, 0, null));
+        map.put("road", new Profile(
+                Set.of("black", "gray"),
+                Set.of("concrete", "wool", "stone"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("zebra crossing", new Profile(
+                Set.of("black", "white"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                6, 0, null));
+        map.put("checkerboard", new Profile(
+                Set.of("black", "white"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                8, 0, null));
+        map.put("flag of usa", new Profile(
+                Set.of("red", "white", "blue"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("usa flag", new Profile(
+                Set.of("red", "white", "blue"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("british flag", new Profile(
+                Set.of("red", "white", "blue"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("french flag", new Profile(
+                Set.of("red", "white", "blue"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("german flag", new Profile(
+                Set.of("red", "yellow", "black"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("italian flag", new Profile(
+                Set.of("red", "white", "green"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                10, 0, null));
+        map.put("nyan cat", new Profile(
+                Set.of("pink", "red", "yellow", "green", "blue", "purple", "gray"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                15, 0, null));
+        map.put("among us", new Profile(
+                Set.of("red", "blue", "green", "yellow"),
+                Set.of("wool", "concrete", "glass"),
+                List.of(Shape.SYMMETRIC),
+                8, 0, null));
+        map.put("crewmate", new Profile(
+                Set.of("red", "blue", "green", "yellow"),
+                Set.of("wool", "concrete"),
+                List.of(),
+                6, 0, null));
+        map.put("minecraft", new Profile(
+                Set.of("green", "brown"),
+                Set.of("dirt", "grass", "wood"),
+                List.of(Shape.FLAT),
+                15, 0, null));
+        map.put("steve", new Profile(
+                Set.of("blue", "brown", "white", "pink"),
+                Set.of("wool"),
+                List.of(Shape.TALL, Shape.SYMMETRIC),
+                12, 0, null));
+        map.put("witch", new Profile(
+                Set.of("purple", "black", "green"),
+                Set.of("wool"),
+                List.of(Shape.TALL),
+                10, 0, null));
+        map.put("santa", new Profile(
+                Set.of("red", "white"),
+                Set.of("wool"),
+                List.of(Shape.TALL),
+                10, 0, null));
+        map.put("santa claus", new Profile(
+                Set.of("red", "white"),
+                Set.of("wool"),
+                List.of(Shape.TALL),
+                10, 0, null));
+        map.put("christmas tree", new Profile(
+                Set.of("green", "red", "yellow"),
+                Set.of("leaves", "wool"),
+                List.of(Shape.TALL),
+                15, 0, null));
+        map.put("birthday cake", new Profile(
+                Set.of("white", "pink"),
+                Set.of("wool", "snow"),
+                List.of(Shape.SYMMETRIC),
+                8, 0, null));
+        map.put("candle", new Profile(
+                Set.of("white", "red", "yellow"),
+                Set.of("wool"),
+                List.of(Shape.TALL_NARROW),
+                4, 0, null));
+        map.put("ladder", new Profile(
+                Set.of("brown"),
+                Set.of("ladder", "wood", "fence"),
+                List.of(Shape.TALL_NARROW),
+                4, 0, null));
+        map.put("wheel", new Profile(
+                Set.of("black", "gray"),
+                Set.of("wool", "concrete"),
+                List.of(Shape.FLAT_ROUND),
+                6, 0, null));
+        map.put("ferris wheel", new Profile(
+                Set.of("red", "blue"),
+                Set.of("wool", "iron"),
+                List.of(Shape.SYMMETRIC),
+                20, 0, null));
+        map.put("windmill", new Profile(
+                Set.of("white", "brown"),
+                Set.of("wool", "wood", "planks"),
+                List.of(Shape.TALL),
+                15, 0, null));
+        map.put("solar panel", new Profile(
+                Set.of("blue", "black"),
+                Set.of("glass", "wool"),
+                List.of(Shape.FLAT),
+                6, 0, null));
+        map.put("door", new Profile(
+                Set.of("brown"),
+                Set.of("door", "wood", "planks"),
+                List.of(Shape.TALL),
+                2, 12, null));
+        map.put("window", new Profile(
+                Set.of(),
+                Set.of("glass"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                4, 0, null));
+        map.put("bowtie", new Profile(
+                Set.of("red", "black"),
+                Set.of("wool"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                4, 0, null));
+        map.put("bow tie", new Profile(
+                Set.of("red", "black"),
+                Set.of("wool"),
+                List.of(Shape.FLAT, Shape.SYMMETRIC),
+                4, 0, null));
+        map.put("watch", new Profile(
+                Set.of("black", "gray", "yellow"),
+                Set.of("wool", "iron", "gold"),
+                List.of(Shape.FLAT_ROUND),
+                4, 0, null));
+        map.put("ring", new Profile(
+                Set.of("yellow", "gray"),
+                Set.of("gold", "iron"),
+                List.of(Shape.FLAT_ROUND),
+                4, 0, null));
+        map.put("trophy", new Profile(
+                Set.of("yellow"),
+                Set.of("gold", "wool"),
+                List.of(Shape.TALL, Shape.SYMMETRIC),
+                6, 0, null));
+        map.put("medal", new Profile(
+                Set.of("yellow"),
+                Set.of("gold", "wool"),
+                List.of(Shape.FLAT_ROUND),
+                4, 0, null));
+        map.put("ladder", new Profile(
+                Set.of("brown"),
+                Set.of("ladder", "wood"),
+                List.of(Shape.TALL_NARROW),
+                4, 0, null));
+        map.put("staircase", new Profile(
+                Set.of(),
+                Set.of("stairs"),
+                List.of(),
+                6, 0, null));
+        map.put("fence", new Profile(
+                Set.of("brown"),
+                Set.of("fence", "wood"),
+                List.of(Shape.WIDE),
+                6, 0, null));
+        map.put("graveyard", new Profile(
+                Set.of("gray", "brown"),
+                Set.of("stone", "cobblestone", "dirt"),
+                List.of(Shape.FLAT),
+                10, 0, null));
+        map.put("tombstone", new Profile(
+                Set.of("gray"),
+                Set.of("stone", "cobblestone", "quartz"),
+                List.of(Shape.TALL),
+                6, 0, null));
+        map.put("coffin", new Profile(
+                Set.of("brown", "black"),
+                Set.of("wood", "planks", "wool"),
+                List.of(Shape.WIDE),
+                8, 0, null));
 
         return Map.copyOf(map);
     }

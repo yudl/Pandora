@@ -18,18 +18,21 @@ import java.util.List;
 public class GTBSolverModule extends Module {
 
     public static final String MODE_MANUAL = "manual";
-    public static final String MODE_AUTO_HINTS = "auto hints";
-    public static final String MODE_AUTO_HINTS_PREHINT = "auto hints + prehint";
+    public static final String MODE_AUTO_HINTS = "auto";
+    public static final String MODE_AUTO_HINTS_SCANNER = "auto + scanner";
+    // Back-compat: older configs may still hold these legacy mode strings.
+    public static final String LEGACY_MODE_AUTO_HINTS = "auto hints";
+    public static final String LEGACY_MODE_AUTO_HINTS_PREHINT = "auto hints + prehint";
 
     private final ModeSetting guessMode = new ModeSetting(
             "guess_mode",
-            "guess mode",
-            List.of(MODE_MANUAL, MODE_AUTO_HINTS, MODE_AUTO_HINTS_PREHINT),
+            "mode",
+            List.of(MODE_MANUAL, MODE_AUTO_HINTS, MODE_AUTO_HINTS_SCANNER),
             MODE_MANUAL
     );
-    private final BooleanSetting rotateMatches = new BooleanSetting("rotate_matches", "rotate matches", true);
-    private final BooleanSetting activeRoundOnly = new BooleanSetting("active_round_only", "active round only", true);
-    private final BooleanSetting guessHistoryHud = new BooleanSetting("guess_history_hud", "guess history hud", true);
+    private final BooleanSetting rotateMatches = new BooleanSetting("rotate_matches", "rotate", true);
+    private final BooleanSetting activeRoundOnly = new BooleanSetting("active_round_only", "round-only", true);
+    private final BooleanSetting guessHistoryHud = new BooleanSetting("guess_history_hud", "history hud", true);
 
     private final List<ModuleSetting<?>> settings = List.of(
             guessMode,
@@ -50,10 +53,19 @@ public class GTBSolverModule extends Module {
     @Override
     public void onConfigLoaded() {
         PandoraConfig config = PandoraConfig.getInstance();
-        guessMode.setValue(config.getModuleTextOption(getName(), guessMode.getId(), MODE_MANUAL));
+        String savedMode = config.getModuleTextOption(getName(), guessMode.getId(), MODE_MANUAL);
+        guessMode.setValue(migrateLegacyMode(savedMode));
         rotateMatches.setValue(config.getModuleOption(getName(), rotateMatches.getId(), true));
         activeRoundOnly.setValue(config.getModuleOption(getName(), activeRoundOnly.getId(), true));
         guessHistoryHud.setValue(config.getModuleOption(getName(), guessHistoryHud.getId(), true));
+    }
+
+    private static String migrateLegacyMode(String value) {
+        if (value == null) return MODE_MANUAL;
+        String normalized = value.toLowerCase(java.util.Locale.ROOT).trim();
+        if (LEGACY_MODE_AUTO_HINTS_PREHINT.equals(normalized)) return MODE_AUTO_HINTS_SCANNER;
+        if (LEGACY_MODE_AUTO_HINTS.equals(normalized)) return MODE_AUTO_HINTS;
+        return normalized;
     }
 
     @Override
@@ -85,8 +97,8 @@ public class GTBSolverModule extends Module {
         if (!isEnabled()) {
             return "-";
         }
-        if (guessMode.is(MODE_AUTO_HINTS_PREHINT)) {
-            return "a+p";
+        if (guessMode.is(MODE_AUTO_HINTS_SCANNER)) {
+            return "a+s";
         }
         if (guessMode.is(MODE_AUTO_HINTS)) {
             return "a";
@@ -119,11 +131,11 @@ public class GTBSolverModule extends Module {
     }
 
     private String modeDescription() {
-        if (guessMode.is(MODE_AUTO_HINTS_PREHINT)) {
-            return "Auto rotates hint guesses and pre-hint plot reads.";
+        if (guessMode.is(MODE_AUTO_HINTS_SCANNER)) {
+            return "Auto-guesses hints and scans the build for pre-hint guesses.";
         }
         if (guessMode.is(MODE_AUTO_HINTS)) {
-            return "Auto rotates hint guesses.";
+            return "Auto-guesses hint matches.";
         }
         return "Manual clickable suggestions.";
     }

@@ -9,6 +9,8 @@ import com.google.gson.JsonObject;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.registry.Registries;
 import net.minecraft.scoreboard.Scoreboard;
 import net.minecraft.scoreboard.ScoreboardDisplaySlot;
@@ -21,7 +23,6 @@ import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
 
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -31,7 +32,6 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -42,7 +42,12 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Guess The Build solver and heuristic build reader for modern Fabric.
+ * Guess The Build solver: hint matching + lightweight build scanner.
+ *
+ * Block scanning is fully event-driven (per-block-update packets routed via the
+ * Block/Chunk delta mixins). Plot detection no longer scans large world volumes
+ * every tick; it anchors once per round to the player's position with a tiny
+ * 6-block downward floor probe.
  */
 public class GTBSolverEngine {
 
@@ -51,107 +56,104 @@ public class GTBSolverEngine {
     private static final Pattern FORMATTING_CODE = Pattern.compile(Pattern.quote(String.valueOf(FORMAT_CODE)) + "[0-9a-fk-or]", Pattern.CASE_INSENSITIVE);
     private static final Pattern THEME_HINT = Pattern.compile("(?i).*\\b(?:theme|hint|word)\\b(?:\\s+(?:is|starts\\s+with|contains))?\\s*:?[\\s-]*(.+)$");
     private static final Pattern THEME_REVEAL = Pattern.compile("(?i).*theme was\\s*:?[\\s-]*(.+?)(?:[!.]|$)");
+    private static final Pattern ROUND_OF = Pattern.compile("(?i)round\\s*:?\\s*(\\d+)\\s*/\\s*(\\d+)");
 
     private static final int MAX_DISPLAYED_MATCHES = 100;
     private static final long AUTO_GUESS_INTERVAL_MS = 3_000L;
-    private static final long PRE_HINT_SCAN_INTERVAL_MS = 700L;
-    private static final long GAME_SIGNAL_GRACE_MS = 20_000L;
-    private static final long ROUND_SIGNAL_GRACE_MS = 15_000L;
-    private static final long PLOT_SEARCH_INTERVAL_MS = 1_500L;
-    private static final int PLOT_HALF_SIZE = 13;
-    private static final int PLOT_SCAN_MIN_Y = -3;
-    private static final int PLOT_SCAN_MAX_Y = 32;
-    private static final int PRE_HINT_MIN_BLOCKS = 1;
-    private static final double PRE_HINT_MIN_SCORE = 5.0;
-    private static final double PRE_HINT_MIN_LEAD = 1.5;
-    private static final int PRE_HINT_MAX_CHANGED_BLOCKS = 700;
-    private static final int PLOT_SEARCH_RADIUS = 48;
-    private static final int PLOT_SEARCH_VERTICAL = 28;
-    private static final int MIN_WHITE_TERRACOTTA_FLOOR_BLOCKS = 20;
-    private static final int MAX_WHITE_TERRACOTTA_FLOOR_BLOCKS = 1_100;
-    private static final int MAX_PLOT_SPAN = 34;
+    private static final long SCAN_INTERVAL_MS = 750L;
+    private static final long ROUND_RE_ANCHOR_INTERVAL_MS = 750L;
+    private static final long GAME_SIGNAL_GRACE_MS = 30_000L;
+    private static final long ROUND_SIGNAL_GRACE_MS = 25_000L;
+
+    private static final int PLOT_HALF_SIZE = 13;       // 27x27 plot
+    private static final int PLOT_SCAN_BELOW = 2;       // scan 2 below floor (signs/buttons)
+    private static final int PLOT_SCAN_ABOVE = 30;      // 30 above floor
+    private static final int FLOOR_PROBE_RADIUS = 2;    // 5x5 floor lookup
+    private static final int FLOOR_PROBE_DEPTH = 6;     // search up to 6 below player
+    private static final int MAX_PLACED_BLOCKS = 1500;
+    private static final int MIN_SCAN_BLOCKS = 1;
+    private static final double MIN_SCAN_SCORE = 4.0;
+    private static final double SCAN_LEAD_THRESHOLD = 1.8;
+    private static final double SINGLE_BLOCK_LEAD_BONUS = 12.0;
+
     private static final int HUD_X = 6;
     private static final int HUD_Y = 18;
 
-    private static final Set<String> COLOR_WORDS = Set.of(
-            "white", "orange", "magenta", "light", "blue", "yellow", "lime", "pink", "gray", "grey",
-            "silver", "cyan", "purple", "brown", "green", "red", "black"
-    );
-    private static final Set<String> LEGACY_BLOCK_KEYWORDS = Set.of(
-            "stone", "grass", "dirt", "cobblestone", "wood", "planks", "sapling", "bedrock", "water",
-            "lava", "sand", "gravel", "gold", "iron", "coal", "log", "leaves", "sponge", "glass",
-            "lapis", "dispenser", "sandstone", "note", "bed", "rail", "detector", "piston", "wool",
-            "flower", "dandelion", "rose", "mushroom", "slab", "brick", "tnt", "bookshelf", "mossy",
-            "obsidian", "torch", "fire", "spawner", "stairs", "chest", "redstone", "diamond",
-            "crafting", "furnace", "ladder", "lever", "pressure", "button", "snow", "ice", "cactus",
-            "clay", "jukebox", "fence", "pumpkin", "netherrack", "soul", "glowstone", "trapdoor",
-            "stonebrick", "bars", "pane", "melon", "vine", "gate", "mycelium", "lily", "pad",
-            "nether", "cauldron", "enchanting", "brewing", "end", "dragon", "emerald", "beacon",
-            "anvil", "quartz", "hopper", "terracotta", "hay", "carpet", "packed", "slime",
-            "prismarine", "lantern", "sea"
-    );
-    private static final Set<String> ABSOLUTE_SCAN_IGNORES = Set.of(
-            "white_terracotta", "hardened_clay", "white_stained_hardened_clay", "stonebrick", "mossy_stonebrick",
-            "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks", "dark_oak_planks"
-    );
     private static final Map<String, Double> COMMON_THEME_PRIORS = Map.ofEntries(
-            Map.entry("tree", 10.0),
-            Map.entry("house", 9.5),
-            Map.entry("car", 9.0),
-            Map.entry("dog", 8.5),
-            Map.entry("cat", 8.5),
-            Map.entry("flower", 8.0),
-            Map.entry("pizza", 7.8),
-            Map.entry("cake", 7.6),
-            Map.entry("calculator", 7.3),
-            Map.entry("book", 7.1),
-            Map.entry("cup", 7.0),
-            Map.entry("beach", 6.9),
-            Map.entry("bridge", 6.7),
-            Map.entry("castle", 6.6),
-            Map.entry("treehouse", 6.4),
-            Map.entry("traffic light", 6.2),
-            Map.entry("cloud", 6.0),
-            Map.entry("train", 5.8),
-            Map.entry("computer", 5.7),
-            Map.entry("orange juice", 5.5),
-            Map.entry("crafting table", 5.4),
-            Map.entry("swimming pool", 5.2)
+            Map.entry("tree", 8.0),
+            Map.entry("house", 7.0),
+            Map.entry("car", 6.5),
+            Map.entry("dog", 6.0),
+            Map.entry("cat", 6.0),
+            Map.entry("flower", 5.5),
+            Map.entry("pizza", 5.5),
+            Map.entry("cake", 5.0),
+            Map.entry("calculator", 4.5),
+            Map.entry("book", 4.5),
+            Map.entry("cup", 4.5),
+            Map.entry("beach", 4.5),
+            Map.entry("bridge", 4.5),
+            Map.entry("castle", 4.5),
+            Map.entry("treehouse", 4.0),
+            Map.entry("traffic light", 4.0),
+            Map.entry("cloud", 4.0),
+            Map.entry("train", 3.5),
+            Map.entry("computer", 3.5),
+            Map.entry("orange juice", 3.5),
+            Map.entry("crafting table", 3.5),
+            Map.entry("swimming pool", 3.5),
+            Map.entry("anvil", 3.5),
+            Map.entry("tnt", 3.5),
+            Map.entry("snowman", 3.5),
+            Map.entry("cactus", 3.0),
+            Map.entry("bookshelf", 3.0),
+            Map.entry("furnace", 3.0)
     );
 
     private static GTBSolverEngine instance;
 
     private final List<String> themeWords = new ArrayList<>();
     private final Map<String, String> shortestTranslationMap = new HashMap<>();
+    private final Map<String, Set<String>> themeTokenIndex = new HashMap<>();
+    private final Map<String, Set<String>> tokenToThemeKeys = new HashMap<>();
+    private final Map<String, String> themeKeyToOriginal = new HashMap<>();
 
+    // Hint state
     private String lastHint = "";
     private List<String> lastResults = new ArrayList<>();
     private List<String> pendingResults;
+
+    // Auto-guess state
     private final List<String> autoGuessQueue = new ArrayList<>();
     private final List<String> guessHistory = new ArrayList<>();
-    private final Map<String, Double> latestPreHintScores = new HashMap<>();
-    private final Map<Long, String> pendingPlotUpdates = new HashMap<>();
-    private final Map<Long, String> trackedPlotBlocks = new HashMap<>();
+    private int autoGuessIndex;
+    private long lastAutoGuessAt;
+
+    // Round / game signals
     private String activeRoundKey = "";
-    private String lastPreHintGuess = "";
-    private String lastPreHintTheme = "";
-    private String lastHudStatus = "waiting for GTB round";
+    private long lastGameSignalAt;
+    private long lastRoundSignalAt;
+    private long lastBuilderSignalAt;
+    private long lastHintSignalAt;
+    private long lastThemeSignalAt;
+    private long lastActiveRoundAt;
     private String lastRoundLabel = "";
     private String lastBuilderLabel = "";
     private String lastThemeLabel = "";
-    private int lastChangedBlockCount;
-    private long lastAutoGuessAt;
-    private long lastPreHintScanAt;
-    private long lastGameSignalAt;
-    private long lastHintSignalAt;
-    private long lastRoundSignalAt;
-    private long lastBuilderSignalAt;
-    private long lastThemeSignalAt;
-    private long lastActiveRoundAt;
-    private long lastPlotSearchAt;
-    private int autoGuessIndex;
-    private Map<Long, String> roundBaselineBlocks = new HashMap<>();
-    private PlotAnchor lastPlotAnchor = PlotAnchor.unknown();
+
+    // Scanner state
+    private PlotRegion plotRegion;
+    private final Map<Long, String> baseline = new HashMap<>();
+    private final Map<Long, String> placed = new HashMap<>();
+    private long lastScanAt;
+    private long lastReanchorAt;
+    private String lastScannerGuess = "";
+    private String lastScannerTheme = "";
+    private List<ScoredTheme> lastScannerScores = List.of();
+
+    // HUD
+    private String hudStatus = "waiting for GTB round";
+    private int hudPlacedCount;
 
     public static GTBSolverEngine getInstance() {
         if (instance == null) {
@@ -162,7 +164,10 @@ public class GTBSolverEngine {
 
     private GTBSolverEngine() {
         loadTranslationData();
+        buildThemeTokenIndex();
     }
+
+    // ===================== Public API =====================
 
     public void processActionBar(Text message) {
         noteGameSignal(message.getString());
@@ -181,8 +186,9 @@ public class GTBSolverEngine {
 
         long now = System.currentTimeMillis();
         GameContext context = readGameContext();
+
         if (!context.inGuessTheBuild()) {
-            lastHudStatus = "not in GTB";
+            hudStatus = "not in GTB";
             if (now - lastGameSignalAt > GAME_SIGNAL_GRACE_MS) {
                 clearAutomationState();
             }
@@ -194,14 +200,11 @@ public class GTBSolverEngine {
         }
         if (context.activeRound()) {
             lastActiveRoundAt = now;
-            if (context.plotAnchor().isValid() && roundBaselineBlocks.isEmpty()) {
-                captureRoundBaseline(context.plotAnchor());
-            }
         }
 
         boolean hasRecentRound = context.activeRound() || now - lastActiveRoundAt < ROUND_SIGNAL_GRACE_MS;
         if (activeRoundOnly && !hasRecentRound) {
-            lastHudStatus = "waiting for active round";
+            hudStatus = "waiting for active round";
             if (now - lastGameSignalAt > GAME_SIGNAL_GRACE_MS) {
                 clearAutomationState();
             }
@@ -209,10 +212,10 @@ public class GTBSolverEngine {
         }
 
         boolean autoHints = !GTBSolverModule.MODE_MANUAL.equalsIgnoreCase(guessMode);
-        boolean autoPreHint = GTBSolverModule.MODE_AUTO_HINTS_PREHINT.equalsIgnoreCase(guessMode);
+        boolean useScanner = GTBSolverModule.MODE_AUTO_HINTS_SCANNER.equalsIgnoreCase(guessMode);
 
         if (!autoHints) {
-            lastHudStatus = "manual mode";
+            hudStatus = "manual mode";
             autoGuessQueue.clear();
             autoGuessIndex = 0;
             return;
@@ -221,20 +224,23 @@ public class GTBSolverEngine {
         if (context.revealedThemeVisible()) {
             autoGuessQueue.clear();
             autoGuessIndex = 0;
-            latestPreHintScores.clear();
-            lastHudStatus = "theme visible";
+            hudStatus = "theme visible";
             return;
         }
 
-        if (autoPreHint && context.allowPreHint()) {
-            scanPreHintGuess(context);
+        if (useScanner && hasRecentRound) {
+            ensurePlotAnchor(now);
+            if (now - lastScanAt >= SCAN_INTERVAL_MS) {
+                lastScanAt = now;
+                runScannerScan();
+            }
         }
 
-        if (!lastHudStatus.startsWith("scan")
-                && !lastHudStatus.startsWith("no ")
-                && !lastHudStatus.startsWith("locking")
-                && !lastHudStatus.startsWith("prehint")) {
-            lastHudStatus = autoGuessQueue.isEmpty() ? "collecting guesses" : "auto guessing";
+        if (!hudStatus.startsWith("scanner")
+                && !hudStatus.startsWith("auto")
+                && !hudStatus.startsWith("queued")
+                && !hudStatus.startsWith("sent")) {
+            hudStatus = autoGuessQueue.isEmpty() ? "collecting guesses" : "auto guessing";
         }
         sendQueuedAutoGuess(rotateMatches);
     }
@@ -248,39 +254,33 @@ public class GTBSolverEngine {
             results = pendingResults;
             pendingResults = null;
         }
-
         sendSuggestions(results);
     }
 
     public void onBlockUpdate(BlockPos pos, BlockState state) {
-        if (activeRoundKey.isBlank() || !lastPlotAnchor.isValid()) {
+        if (plotRegion == null || !plotRegion.contains(pos)) {
             return;
         }
-        if (!isWithinTrackedPlot(pos, lastPlotAnchor)) {
-            return;
-        }
+        long packed = pos.asLong();
+        String newId = state.isAir() ? "air" : Registries.BLOCK.getId(state.getBlock()).getPath();
 
-        long packedPos = pos.asLong();
-        String blockId = Registries.BLOCK.getId(state.getBlock()).getPath();
-        if (roundBaselineBlocks.isEmpty()) {
-            pendingPlotUpdates.put(packedPos, state.isAir() ? "" : blockId);
+        // If we never sampled this position, treat the very first update as baseline.
+        // (Happens when chunks stream in after the round started.)
+        baseline.putIfAbsent(packed, newId);
+        String base = baseline.get(packed);
+
+        if (newId.equals(base) || GTBBlockSignatures.isLobbyBlock(newId)) {
+            placed.remove(packed);
             return;
         }
-
-        String baseline = roundBaselineBlocks.get(packedPos);
-        if (state.isAir()
-                || baseline == null
-                || blockId.equals(baseline)
-                || isIgnoredBuildBlock(blockId)) {
-            trackedPlotBlocks.remove(packedPos);
+        if (placed.size() >= MAX_PLACED_BLOCKS) {
             return;
         }
-
-        trackedPlotBlocks.put(packedPos, blockId);
+        placed.put(packed, newId);
     }
 
     public void renderGuessHistoryHud(DrawContext context) {
-        int width = 124;
+        int width = 132;
         int headerColor = 0xE014141A;
         int bodyColor = 0xD8101014;
         int accentColor = 0xFFFF4FD8;
@@ -293,13 +293,12 @@ public class GTBSolverEngine {
         context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + 14, headerColor);
         context.fill(HUD_X, HUD_Y, HUD_X + 3, HUD_Y + 14, accentColor);
         context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb guesses", HUD_X + 6, HUD_Y + 3, textColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, lastChangedBlockCount + " blocks", HUD_X + width - 44, HUD_Y + 3, mutedColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudPlacedCount + " blocks", HUD_X + width - 50, HUD_Y + 3, mutedColor);
 
         if (guessHistory.isEmpty()) {
-            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, lastHudStatus, HUD_X + 6, HUD_Y + 18, mutedColor);
+            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudStatus, HUD_X + 6, HUD_Y + 18, mutedColor);
             return;
         }
-
         for (int index = 0; index < historySize; index++) {
             String guess = guessHistory.get(guessHistory.size() - 1 - index);
             context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, guess, HUD_X + 6, HUD_Y + 18 + index * 10, mutedColor);
@@ -312,64 +311,58 @@ public class GTBSolverEngine {
         pendingResults = null;
         autoGuessQueue.clear();
         guessHistory.clear();
-        latestPreHintScores.clear();
+        autoGuessIndex = 0;
+        lastAutoGuessAt = 0L;
         activeRoundKey = "";
-        lastPreHintGuess = "";
-        lastPreHintTheme = "";
-        lastHudStatus = "waiting for GTB round";
+        lastGameSignalAt = 0L;
+        lastRoundSignalAt = 0L;
+        lastBuilderSignalAt = 0L;
+        lastHintSignalAt = 0L;
+        lastThemeSignalAt = 0L;
+        lastActiveRoundAt = 0L;
         lastRoundLabel = "";
         lastBuilderLabel = "";
         lastThemeLabel = "";
-        lastChangedBlockCount = 0;
-        lastAutoGuessAt = 0L;
-        lastPreHintScanAt = 0L;
-        lastGameSignalAt = 0L;
-        lastHintSignalAt = 0L;
-        lastRoundSignalAt = 0L;
-        lastBuilderSignalAt = 0L;
-        lastThemeSignalAt = 0L;
-        lastActiveRoundAt = 0L;
-        lastPlotSearchAt = 0L;
-        autoGuessIndex = 0;
-        roundBaselineBlocks = new HashMap<>();
-        pendingPlotUpdates.clear();
-        trackedPlotBlocks.clear();
-        lastPlotAnchor = PlotAnchor.unknown();
+        plotRegion = null;
+        baseline.clear();
+        placed.clear();
+        lastScanAt = 0L;
+        lastReanchorAt = 0L;
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
+        hudStatus = "waiting for GTB round";
+        hudPlacedCount = 0;
     }
+
+    public String getShortestTranslation(String englishWord) {
+        return shortestTranslationMap.getOrDefault(englishWord.toLowerCase(Locale.ROOT), englishWord);
+    }
+
+    public List<String> getThemeWords() {
+        return Collections.unmodifiableList(themeWords);
+    }
+
+    // ===================== Theme loading =====================
 
     private void loadTranslationData() {
         Set<String> seenThemes = new HashSet<>();
-
         try (InputStream stream = getClass().getResourceAsStream("/assets/pandora/translations-data.json")) {
             if (stream == null) {
                 Pandora.LOGGER.error("[GTBSolver] translations-data.json not found in resources.");
                 return;
             }
-
             JsonArray array = new Gson().fromJson(new InputStreamReader(stream, StandardCharsets.UTF_8), JsonArray.class);
             for (JsonElement element : array) {
-                if (!element.isJsonObject()) {
-                    continue;
-                }
-
+                if (!element.isJsonObject()) continue;
                 JsonObject entry = element.getAsJsonObject();
-                if (!entry.has("theme")) {
-                    continue;
-                }
-
+                if (!entry.has("theme")) continue;
                 String theme = clean(entry.get("theme").getAsString());
-                if (theme.isEmpty()) {
-                    continue;
-                }
-
+                if (theme.isEmpty()) continue;
                 String key = theme.toLowerCase(Locale.ROOT);
-                if (seenThemes.add(key)) {
-                    themeWords.add(theme);
-                }
-
+                if (seenThemes.add(key)) themeWords.add(theme);
                 shortestTranslationMap.put(key, findShortestTranslation(entry, theme));
             }
-
             themeWords.sort(String.CASE_INSENSITIVE_ORDER);
             Pandora.LOGGER.info("[GTBSolver] Loaded {} Guess The Build themes.", themeWords.size());
         } catch (Exception exception) {
@@ -380,76 +373,76 @@ public class GTBSolverEngine {
     private String findShortestTranslation(JsonObject entry, String englishTheme) {
         String shortest = englishTheme;
         int shortestLength = codePointLength(shortest);
-
-        if (!entry.has("translations") || !entry.get("translations").isJsonObject()) {
-            return shortest;
-        }
-
+        if (!entry.has("translations") || !entry.get("translations").isJsonObject()) return shortest;
         for (Map.Entry<String, JsonElement> language : entry.getAsJsonObject("translations").entrySet()) {
-            if (!language.getValue().isJsonObject()) {
-                continue;
-            }
-
+            if (!language.getValue().isJsonObject()) continue;
             JsonObject translationObject = language.getValue().getAsJsonObject();
-            if (!translationObject.has("translation")) {
-                continue;
-            }
-
+            if (!translationObject.has("translation")) continue;
             String translation = clean(translationObject.get("translation").getAsString());
-            if (translation.isEmpty()) {
-                continue;
-            }
-
+            if (translation.isEmpty()) continue;
             int length = codePointLength(translation);
             if (length < shortestLength) {
                 shortest = translation;
                 shortestLength = length;
             }
         }
-
         return shortest;
     }
 
+    private void buildThemeTokenIndex() {
+        for (String theme : themeWords) {
+            String key = theme.toLowerCase(Locale.ROOT);
+            themeKeyToOriginal.put(key, theme);
+            Set<String> tokens = themeNameTokens(theme);
+            themeTokenIndex.put(key, tokens);
+            for (String token : tokens) {
+                tokenToThemeKeys.computeIfAbsent(token, t -> new HashSet<>()).add(key);
+            }
+        }
+    }
+
+    private static Set<String> themeNameTokens(String theme) {
+        String normalized = theme.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").trim();
+        Set<String> tokens = new HashSet<>();
+        for (String part : normalized.split("\\s+")) {
+            if (!part.isBlank() && part.length() >= 2) {
+                tokens.add(part);
+            }
+        }
+        return tokens;
+    }
+
+    // ===================== Hint extraction =====================
+
     private Optional<String> extractHint(Text message, boolean allowLooseHint) {
         Optional<String> styledHint = extractYellowText(message);
-        if (styledHint.isPresent()) {
-            return styledHint;
-        }
+        if (styledHint.isPresent()) return styledHint;
 
         String plain = message.getString();
-        if (!plain.contains("_")) {
-            return Optional.empty();
-        }
+        if (!plain.contains("_")) return Optional.empty();
 
         String plainWithoutFormatting = stripFormatting(plain);
         int colonIndex = plainWithoutFormatting.lastIndexOf(':');
         if (colonIndex >= 0 && plainWithoutFormatting.substring(colonIndex + 1).contains("_")) {
             return normalizeHint(plainWithoutFormatting.substring(colonIndex + 1));
         }
-
         Matcher themeMatcher = THEME_HINT.matcher(plainWithoutFormatting);
         if (themeMatcher.matches() && themeMatcher.group(1).contains("_")) {
             return normalizeHint(themeMatcher.group(1));
         }
-
         Matcher legacyMatcher = LEGACY_YELLOW_HINT.matcher(plain);
-        if (legacyMatcher.find()) {
-            return normalizeHint(legacyMatcher.group());
-        }
-
+        if (legacyMatcher.find()) return normalizeHint(legacyMatcher.group());
         return allowLooseHint ? extractLooseHintRun(plainWithoutFormatting) : Optional.empty();
     }
 
     private Optional<String> extractYellowText(Text message) {
         StringBuilder hint = new StringBuilder();
-
         message.visit((style, text) -> {
             if (style.getColor() != null && "yellow".equals(style.getColor().getName()) && text.contains("_")) {
                 hint.append(text);
             }
             return Optional.empty();
         }, Style.EMPTY);
-
         return normalizeHint(hint.toString());
     }
 
@@ -458,11 +451,7 @@ public class GTBSolverEngine {
         hint = hint.replaceAll("[^\\p{L}\\p{N}_ '\\-]", " ");
         hint = hint.replaceAll("\\s+", " ");
         hint = clean(hint).toLowerCase(Locale.ROOT);
-
-        if (!hint.contains("_") || hint.length() > 80) {
-            return Optional.empty();
-        }
-
+        if (!hint.contains("_") || hint.length() > 80) return Optional.empty();
         return Optional.of(hint);
     }
 
@@ -471,43 +460,29 @@ public class GTBSolverEngine {
         List<String> tokens = new ArrayList<>();
         for (String token : rawTokens) {
             String cleaned = token.replaceAll("^[^\\p{L}\\p{N}_]+|[^\\p{L}\\p{N}_]+$", "");
-            if (!cleaned.isEmpty()) {
-                tokens.add(cleaned);
-            }
+            if (!cleaned.isEmpty()) tokens.add(cleaned);
         }
-
         int firstHintToken = -1;
         int lastHintToken = -1;
         for (int index = 0; index < tokens.size(); index++) {
             if (tokens.get(index).contains("_")) {
-                if (firstHintToken == -1) {
-                    firstHintToken = index;
-                }
+                if (firstHintToken == -1) firstHintToken = index;
                 lastHintToken = index;
             }
         }
-
-        if (firstHintToken == -1) {
-            return Optional.empty();
-        }
-
+        if (firstHintToken == -1) return Optional.empty();
         return normalizeHint(String.join(" ", tokens.subList(firstHintToken, lastHintToken + 1)));
     }
 
     private void processHint(String hint) {
-        if (hint.equals(lastHint)) {
-            return;
-        }
+        if (hint.equals(lastHint)) return;
         lastHintSignalAt = System.currentTimeMillis();
         lastThemeSignalAt = lastHintSignalAt;
         lastActiveRoundAt = lastHintSignalAt;
         lastHint = hint;
 
         List<String> matches = rankHintMatches(findHintMatches(hint));
-
-        if (matches.equals(lastResults) && !matches.isEmpty()) {
-            return;
-        }
+        if (matches.equals(lastResults) && !matches.isEmpty()) return;
 
         lastResults = matches;
         updateAutoGuessQueue(matches);
@@ -518,22 +493,16 @@ public class GTBSolverEngine {
 
     private List<String> findHintMatches(String hint) {
         int length = hint.length();
-        long spaces = hint.chars().filter(character -> character == ' ').count();
-
-        List<int[]> revealedCharacters = new ArrayList<>();
-        for (int index = 0; index < hint.length(); index++) {
-            char character = hint.charAt(index);
-            if (character != '_' && character != ' ') {
-                revealedCharacters.add(new int[]{index, character});
-            }
+        long spaces = hint.chars().filter(c -> c == ' ').count();
+        List<int[]> revealed = new ArrayList<>();
+        for (int i = 0; i < hint.length(); i++) {
+            char c = hint.charAt(i);
+            if (c != '_' && c != ' ') revealed.add(new int[]{i, c});
         }
-
         return themeWords.stream()
                 .filter(word -> word.length() == length)
-                .filter(word -> word.chars().filter(character -> character == ' ').count() == spaces)
-                .filter(word -> matchesRevealedCharacters(word, revealedCharacters))
-                .collect(Collectors.toCollection(LinkedHashSet::new))
-                .stream()
+                .filter(word -> word.chars().filter(c -> c == ' ').count() == spaces)
+                .filter(word -> matchesRevealedCharacters(word, revealed))
                 .collect(Collectors.toList());
     }
 
@@ -544,76 +513,52 @@ public class GTBSolverEngine {
                 .collect(Collectors.toList());
     }
 
-    private List<String> fallbackHintCandidates() {
-        return latestPreHintScores.entrySet().stream()
-                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                .limit(8)
-                .map(entry -> themeWords.stream()
-                        .filter(theme -> theme.equalsIgnoreCase(entry.getKey()))
-                        .findFirst()
-                        .orElse(entry.getKey()))
-                .collect(Collectors.toList());
-    }
-
     private double hintCandidateScore(String theme) {
         String key = theme.toLowerCase(Locale.ROOT);
-        double score = latestPreHintScores.getOrDefault(key, 0.0);
-        score += frequencyBias(theme);
-        if (theme.equalsIgnoreCase(lastPreHintTheme)) {
-            score += 8.0;
+        double score = 0.0;
+        for (ScoredTheme scoredTheme : lastScannerScores) {
+            if (scoredTheme.theme().equalsIgnoreCase(key)) {
+                score += scoredTheme.score();
+                break;
+            }
         }
+        score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0);
+        score += PandoraConfig.getInstance().getThemeFrequency(theme) * 1.15;
+        if (theme.equalsIgnoreCase(lastScannerTheme)) score += 8.0;
         return score;
     }
 
-    private double frequencyBias(String theme) {
-        String normalized = normalizeTheme(theme);
-        return COMMON_THEME_PRIORS.getOrDefault(normalized, 0.0)
-                + PandoraConfig.getInstance().getThemeFrequency(theme) * 1.15;
-    }
-
-    private boolean matchesRevealedCharacters(String word, List<int[]> revealedCharacters) {
+    private boolean matchesRevealedCharacters(String word, List<int[]> revealed) {
         String lowerWord = word.toLowerCase(Locale.ROOT);
-        for (int[] revealed : revealedCharacters) {
-            if (lowerWord.charAt(revealed[0]) != (char) revealed[1]) {
-                return false;
-            }
+        for (int[] r : revealed) {
+            if (lowerWord.charAt(r[0]) != (char) r[1]) return false;
         }
         return true;
     }
 
     private void updateAutoGuessQueue(List<String> englishCandidates) {
-        if (englishCandidates.equals(autoGuessQueue)) {
-            return;
-        }
+        if (englishCandidates.equals(autoGuessQueue)) return;
         autoGuessQueue.clear();
         autoGuessQueue.addAll(englishCandidates);
         autoGuessIndex = 0;
         lastAutoGuessAt = 0L;
-        if (!englishCandidates.isEmpty()) {
-            lastHudStatus = "queued " + englishCandidates.size() + " guesses";
-        }
+        if (!englishCandidates.isEmpty()) hudStatus = "queued " + englishCandidates.size();
     }
 
     private void sendSuggestions(List<String> matches) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null) {
-            return;
-        }
-
+        if (client.player == null) return;
         if (matches.isEmpty()) {
             client.player.sendMessage(prefix().append(Text.literal("No GTB matches found.").formatted(Formatting.GRAY)), false);
-            lastHudStatus = "no hint matches";
+            hudStatus = "no hint matches";
             return;
         }
-
         client.player.sendMessage(prefix()
                 .append(Text.literal("GTB Solver ").formatted(Formatting.GRAY))
                 .append(Text.literal("(" + matches.size() + " matches)").formatted(Formatting.YELLOW)), false);
-
-        for (int index = 0; index < Math.min(matches.size(), MAX_DISPLAYED_MATCHES); index++) {
-            client.player.sendMessage(createSuggestionEntry(matches.get(index)), false);
+        for (int i = 0; i < Math.min(matches.size(), MAX_DISPLAYED_MATCHES); i++) {
+            client.player.sendMessage(createSuggestionEntry(matches.get(i)), false);
         }
-
         if (matches.size() > MAX_DISPLAYED_MATCHES) {
             client.player.sendMessage(prefix()
                     .append(Text.literal("... and " + (matches.size() - MAX_DISPLAYED_MATCHES) + " more.").formatted(Formatting.DARK_GRAY)), false);
@@ -621,22 +566,15 @@ public class GTBSolverEngine {
     }
 
     private void sendQueuedAutoGuess(boolean rotateMatches) {
-        if (autoGuessQueue.isEmpty()) {
-            return;
-        }
-
+        if (autoGuessQueue.isEmpty()) return;
         long now = System.currentTimeMillis();
-        if (now - lastAutoGuessAt < AUTO_GUESS_INTERVAL_MS) {
-            return;
-        }
-
+        if (now - lastAutoGuessAt < AUTO_GUESS_INTERVAL_MS) return;
         int queueIndex = rotateMatches && autoGuessQueue.size() > 1 ? autoGuessIndex % autoGuessQueue.size() : 0;
         String englishGuess = autoGuessQueue.get(queueIndex);
         String translatedGuess = getShortestTranslation(englishGuess);
-
         if (sendChatMessage(translatedGuess)) {
             lastAutoGuessAt = now;
-            lastHudStatus = "sent " + translatedGuess;
+            hudStatus = "sent " + translatedGuess;
             if (rotateMatches && autoGuessQueue.size() > 1) {
                 autoGuessIndex = (autoGuessIndex + 1) % autoGuessQueue.size();
             }
@@ -645,10 +583,7 @@ public class GTBSolverEngine {
 
     private boolean sendChatMessage(String message) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.getNetworkHandler() == null) {
-            return false;
-        }
-
+        if (client.player == null || client.getNetworkHandler() == null) return false;
         client.getNetworkHandler().sendChatMessage(message);
         appendGuessHistory(message);
         return true;
@@ -656,361 +591,352 @@ public class GTBSolverEngine {
 
     private void appendGuessHistory(String guess) {
         guessHistory.add(guess);
-        while (guessHistory.size() > 12) {
-            guessHistory.removeFirst();
-        }
+        while (guessHistory.size() > 12) guessHistory.removeFirst();
     }
 
     private void noteGameSignal(String message) {
-        String plainMessage = stripFormatting(message).trim();
-        String lowerMessage = plainMessage.toLowerCase(Locale.ROOT);
+        String plain = stripFormatting(message).trim();
+        String lower = plain.toLowerCase(Locale.ROOT);
         long now = System.currentTimeMillis();
-        if (lowerMessage.contains("guess the build")
-                || lowerMessage.contains("builder:")
-                || lowerMessage.contains("round:")
-                || lowerMessage.contains("theme:")
-                || lowerMessage.contains("you guessed")
-                || lowerMessage.contains("_")) {
+        if (lower.contains("guess the build") || lower.contains("builder:") || lower.contains("round:")
+                || lower.contains("theme:") || lower.contains("you guessed") || lower.contains("_")
+                || ROUND_OF.matcher(plain).find()) {
             lastGameSignalAt = now;
         }
-
-        if (lowerMessage.contains("round:")) {
+        if (lower.contains("round:") || ROUND_OF.matcher(plain).find()) {
             lastRoundSignalAt = now;
-            lastRoundLabel = extractValueAfterColon(plainMessage, "round");
+            lastRoundLabel = extractValueAfterColon(plain, "round");
+            if (lastRoundLabel.isBlank()) {
+                Matcher m = ROUND_OF.matcher(plain);
+                if (m.find()) lastRoundLabel = m.group(1) + "/" + m.group(2);
+            }
         }
-        if (lowerMessage.contains("builder:")) {
+        if (lower.contains("builder:")) {
             lastBuilderSignalAt = now;
-            lastBuilderLabel = extractValueAfterColon(plainMessage, "builder");
+            lastBuilderLabel = extractValueAfterColon(plain, "builder");
         }
-        if (lowerMessage.contains("theme:")) {
+        if (lower.contains("theme:")) {
             lastThemeSignalAt = now;
-            lastThemeLabel = extractValueAfterColon(plainMessage, "theme");
+            lastThemeLabel = extractValueAfterColon(plain, "theme");
         }
     }
 
     private void handleThemeReveal(String message) {
         String plain = stripFormatting(message).trim();
         Matcher matcher = THEME_REVEAL.matcher(plain);
-        if (!matcher.matches()) {
-            return;
-        }
-
-        String revealedTheme = clean(matcher.group(1));
-        if (revealedTheme.isEmpty()) {
-            return;
-        }
-
+        if (!matcher.matches()) return;
+        String revealed = clean(matcher.group(1));
+        if (revealed.isEmpty()) return;
         lastThemeSignalAt = System.currentTimeMillis();
-        lastThemeLabel = revealedTheme;
-
+        lastThemeLabel = revealed;
         PandoraConfig config = PandoraConfig.getInstance();
-        config.incrementThemeFrequency(revealedTheme);
-        if (revealedTheme.equalsIgnoreCase(lastPreHintTheme)) {
-            config.incrementThemeFrequency(revealedTheme);
-        }
+        config.incrementThemeFrequency(revealed);
+        if (revealed.equalsIgnoreCase(lastScannerTheme)) config.incrementThemeFrequency(revealed);
     }
 
     private void clearAutoGuessOnRoundMessage(String message) {
-        String lowerMessage = stripFormatting(message).toLowerCase(Locale.ROOT);
-        if (lowerMessage.contains("_")) {
-            return;
-        }
-
-        if (lowerMessage.contains("you guessed")
-                || lowerMessage.contains("guessed the theme")
-                || lowerMessage.contains("the theme was")
-                || lowerMessage.contains("round over")
-                || lowerMessage.contains("game over")) {
+        String lower = stripFormatting(message).toLowerCase(Locale.ROOT);
+        if (lower.contains("_")) return;
+        if (lower.contains("you guessed") || lower.contains("guessed the theme")
+                || lower.contains("the theme was") || lower.contains("round over")
+                || lower.contains("game over") || lower.contains("next round")) {
             autoGuessQueue.clear();
             autoGuessIndex = 0;
-            lastPreHintGuess = "";
-            lastPreHintTheme = "";
-            latestPreHintScores.clear();
-            lastChangedBlockCount = 0;
+            lastScannerGuess = "";
+            lastScannerTheme = "";
+            lastScannerScores = List.of();
+            hudPlacedCount = 0;
             lastHint = "";
         }
     }
 
-    private void scanPreHintGuess(GameContext context) {
-        long now = System.currentTimeMillis();
-        if (now - lastPreHintScanAt < PRE_HINT_SCAN_INTERVAL_MS) {
+    // ===================== Scanner =====================
+
+    private void ensurePlotAnchor(long now) {
+        if (plotRegion != null && now - lastReanchorAt < ROUND_RE_ANCHOR_INTERVAL_MS) return;
+        lastReanchorAt = now;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientPlayerEntity player = client.player;
+        ClientWorld world = client.world;
+        if (player == null || world == null) return;
+
+        // Keep the current anchor if the player is still standing inside the plot
+        // (covers the common case where they walk a few blocks during their build).
+        if (plotRegion != null) {
+            int dx = Math.abs(player.getBlockX() - plotRegion.centerX);
+            int dz = Math.abs(player.getBlockZ() - plotRegion.centerZ);
+            int dy = Math.abs(player.getBlockY() - plotRegion.floorY);
+            if (dx <= PLOT_HALF_SIZE + 4 && dz <= PLOT_HALF_SIZE + 4 && dy <= 18) {
+                return;
+            }
+            // Player teleported / wandered to a new plot — re-anchor below.
+        }
+
+        anchorPlotToPlayer(player, world);
+    }
+
+    private void anchorPlotToPlayer(ClientPlayerEntity player, ClientWorld world) {
+        int px = player.getBlockX();
+        int pz = player.getBlockZ();
+        int py = player.getBlockY();
+
+        // Find the white-terracotta floor: probe a small 5x5 cross under the player
+        // for up to FLOOR_PROBE_DEPTH blocks down. ~150 lookups, runs at most once
+        // per round.
+        int floorY = Integer.MIN_VALUE;
+        outer:
+        for (int dy = 0; dy <= FLOOR_PROBE_DEPTH; dy++) {
+            int y = py - dy;
+            for (int dx = -FLOOR_PROBE_RADIUS; dx <= FLOOR_PROBE_RADIUS; dx++) {
+                for (int dz = -FLOOR_PROBE_RADIUS; dz <= FLOOR_PROBE_RADIUS; dz++) {
+                    BlockState state = world.getBlockState(new BlockPos(px + dx, y, pz + dz));
+                    if (isWhiteTerracotta(state)) {
+                        floorY = y;
+                        break outer;
+                    }
+                }
+            }
+        }
+        if (floorY == Integer.MIN_VALUE) {
+            // Fall back to player.Y - 1 so the scanner still functions even if the
+            // plot floor isn't in render distance yet.
+            floorY = py - 1;
+        }
+
+        plotRegion = new PlotRegion(px, floorY, pz);
+        baseline.clear();
+        placed.clear();
+        captureBaseline(world);
+        hudStatus = "scanner armed";
+    }
+
+    private void captureBaseline(ClientWorld world) {
+        if (plotRegion == null) return;
+        int xMin = plotRegion.centerX - PLOT_HALF_SIZE;
+        int xMax = plotRegion.centerX + PLOT_HALF_SIZE;
+        int zMin = plotRegion.centerZ - PLOT_HALF_SIZE;
+        int zMax = plotRegion.centerZ + PLOT_HALF_SIZE;
+        int yMin = plotRegion.floorY - PLOT_SCAN_BELOW;
+        int yMax = plotRegion.floorY + PLOT_SCAN_ABOVE;
+        // 27 * 27 * 33 = ~24k single-pass world lookups, executed once per round.
+        for (BlockPos pos : BlockPos.iterate(xMin, yMin, zMin, xMax, yMax, zMax)) {
+            BlockState state = world.getBlockState(pos);
+            String id = Registries.BLOCK.getId(state.getBlock()).getPath();
+            baseline.put(pos.asLong(), id);
+        }
+    }
+
+    private void runScannerScan() {
+        hudPlacedCount = placed.size();
+        if (plotRegion == null) {
+            hudStatus = "scanner: no plot";
             return;
         }
-        lastPreHintScanAt = now;
-
-        if (roundBaselineBlocks.isEmpty() && context.plotAnchor().isValid()) {
-            captureRoundBaseline(context.plotAnchor());
-            lastHudStatus = "locking baseline";
-            lastChangedBlockCount = 0;
+        if (placed.size() < MIN_SCAN_BLOCKS) {
+            lastScannerScores = List.of();
+            hudStatus = "scanner: waiting";
             return;
         }
 
-        Optional<BlockScan> scan = buildTrackedScan(context.plotAnchor());
-        if (scan.isEmpty()) {
-            latestPreHintScores.clear();
-            lastChangedBlockCount = 0;
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastHudStatus = trackedPlotBlocks.isEmpty() ? "waiting for placed blocks" : "no tracked scan";
-            return;
-        }
+        BuildFingerprint fp = BuildFingerprint.fromPlaced(placed, plotRegion);
+        List<ScoredTheme> scored = scoreThemes(fp);
+        lastScannerScores = scored;
 
-        BlockScan blockScan = scan.get();
-        if (blockScan.totalBlocks > PRE_HINT_MAX_CHANGED_BLOCKS) {
-            latestPreHintScores.clear();
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastChangedBlockCount = 0;
-            lastHudStatus = "scan rejected";
-            return;
-        }
-
-        lastChangedBlockCount = blockScan.totalBlocks;
-        latestPreHintScores.clear();
-
-        List<ScoredTheme> scores = themeWords.stream()
-                .map(theme -> new ScoredTheme(theme, scoreThemeAgainstBlocks(theme, blockScan)))
-                .filter(scoredTheme -> scoredTheme.score() >= PRE_HINT_MIN_SCORE)
-                .sorted(Comparator.comparingDouble(ScoredTheme::score).reversed())
-                .limit(32)
-                .toList();
-
-        for (ScoredTheme score : scores) {
-            latestPreHintScores.put(score.theme().toLowerCase(Locale.ROOT), score.score());
-        }
-
-        if (scores.isEmpty()) {
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastHudStatus = "no prehint match";
+        if (scored.isEmpty()) {
+            hudStatus = "scanner: no match";
             return;
         }
 
         if (lastHint.isBlank()) {
-            updateAutoGuessQueue(scores.stream()
-                    .map(ScoredTheme::theme)
-                    .limit(8)
-                    .collect(Collectors.toList()));
+            // No hint yet — feed the auto-guess queue with our top scanner candidates.
+            List<String> queue = new ArrayList<>();
+            for (int i = 0; i < Math.min(scored.size(), 6); i++) {
+                queue.add(scored.get(i).theme());
+            }
+            updateAutoGuessQueue(queue);
         }
 
-        ScoredTheme best = scores.getFirst();
-        double secondScore = scores.size() > 1 ? scores.get(1).score() : 0.0;
-        if (best.score() - secondScore < PRE_HINT_MIN_LEAD) {
-            lastHudStatus = "prehint ambiguous";
+        ScoredTheme best = scored.get(0);
+        double secondScore = scored.size() > 1 ? scored.get(1).score() : 0.0;
+        if (best.score() - secondScore < SCAN_LEAD_THRESHOLD) {
+            hudStatus = "scanner: " + scored.size() + " candidates";
             return;
         }
 
         String shortestGuess = getShortestTranslation(best.theme());
-        if (!shortestGuess.equalsIgnoreCase(lastPreHintGuess)) {
-            lastPreHintGuess = shortestGuess;
-            lastPreHintTheme = best.theme();
-            lastHudStatus = "prehint " + shortestGuess;
-            sendPreHintSuggestion(best.theme());
+        if (!shortestGuess.equalsIgnoreCase(lastScannerGuess)) {
+            lastScannerGuess = shortestGuess;
+            lastScannerTheme = best.theme();
+            hudStatus = "scanner: " + shortestGuess;
+            sendScannerSuggestion(best.theme());
         }
     }
 
-    private Optional<BlockScan> buildTrackedScan(PlotAnchor anchor) {
-        if (!anchor.isValid() || trackedPlotBlocks.isEmpty()) {
-            return Optional.empty();
+    private List<ScoredTheme> scoreThemes(BuildFingerprint fp) {
+        // Restrict scoring to themes whose name overlaps with build tokens, OR have
+        // a curated profile, OR receive a single-block hint, OR are common priors.
+        Set<String> candidateKeys = new HashSet<>();
+        for (String token : fp.tokens()) {
+            Set<String> hits = tokenToThemeKeys.get(token);
+            if (hits != null) candidateKeys.addAll(hits);
+        }
+        for (String hint : fp.singleBlockThemeHints()) {
+            String key = hint.toLowerCase(Locale.ROOT);
+            if (themeKeyToOriginal.containsKey(key)) candidateKeys.add(key);
+        }
+        for (String prior : COMMON_THEME_PRIORS.keySet()) {
+            if (themeKeyToOriginal.containsKey(prior)) candidateKeys.add(prior);
         }
 
-        BlockPos center = anchor.center();
-        BlockScan scan = new BlockScan(center);
-        for (Map.Entry<Long, String> entry : trackedPlotBlocks.entrySet()) {
-            BlockPos pos = BlockPos.fromLong(entry.getKey());
-            if (!isWithinTrackedPlot(pos, anchor)) {
-                continue;
-            }
-            scan.add(pos, entry.getValue());
+        List<ScoredTheme> scored = new ArrayList<>(candidateKeys.size());
+        for (String key : candidateKeys) {
+            String original = themeKeyToOriginal.get(key);
+            if (original == null) continue;
+            double score = scoreTheme(original, fp);
+            if (score >= MIN_SCAN_SCORE) scored.add(new ScoredTheme(original, score));
         }
-
-        return scan.totalBlocks >= PRE_HINT_MIN_BLOCKS ? Optional.of(scan) : Optional.empty();
+        scored.sort(Comparator.comparingDouble(ScoredTheme::score).reversed());
+        if (scored.size() > 32) scored = scored.subList(0, 32);
+        return scored;
     }
 
-    private double scoreThemeAgainstBlocks(String theme, BlockScan scan) {
-        String normalizedTheme = normalizeTheme(theme);
-        Set<String> themeTokens = new HashSet<>(List.of(normalizedTheme.split(" ")));
+    private double scoreTheme(String theme, BuildFingerprint fp) {
+        String key = theme.toLowerCase(Locale.ROOT);
+        Set<String> themeTokens = themeTokenIndex.getOrDefault(key, themeNameTokens(theme));
+
         double score = 0.0;
 
+        // 1) Direct token overlap (theme word literally appears in placed-block tokens)
         for (String token : themeTokens) {
-            if (token.isBlank()) {
-                continue;
-            }
-            score += scan.count(token) * 1.35;
-            if (COLOR_WORDS.contains(token)) {
-                score += scan.count(token) * 0.45;
-            }
-            if (LEGACY_BLOCK_KEYWORDS.contains(token)) {
-                score += scan.count(token) * 1.1;
+            int count = fp.tokenCount(token);
+            if (count > 0) {
+                score += Math.min(count, 25) * 1.4;
+                if (GTBBlockSignatures.isColorToken(token)) {
+                    score += Math.min(count, 25) * 0.4;
+                }
             }
         }
 
-        score += frequencyBias(theme);
-        score += genericComplexityScore(theme, scan);
-        score += shapeScore(theme, scan);
-        score += categoryScore(normalizedTheme, scan);
-        score += directSemanticScore(normalizedTheme, scan);
-        return score;
-    }
-
-    private double genericComplexityScore(String theme, BlockScan scan) {
-        String normalizedTheme = normalizeTheme(theme);
-        boolean simpleWord = !normalizedTheme.contains(" ") && normalizedTheme.length() <= 5;
-        boolean complexWord = normalizedTheme.contains(" ") || normalizedTheme.length() >= 10;
-
-        double score = 0.0;
-        if (scan.totalBlocks <= 4 && simpleWord) {
-            score += 4.0;
+        // 2) Single-block signatures: any placed block ID that flags this exact theme
+        int sigHits = fp.singleBlockThemeHitCount(key);
+        if (sigHits > 0) {
+            score += Math.min(sigHits, 8) * 6.0;
         }
-        if (scan.totalBlocks >= 25 && complexWord) {
-            score += 3.0;
+
+        // 3) Curated theme profile
+        GTBThemeProfiles.Profile profile = GTBThemeProfiles.lookup(theme);
+        if (profile != null) {
+            score += scoreProfile(profile, fp);
         }
-        return score;
-    }
 
-    private double shapeScore(String theme, BlockScan scan) {
-        String normalizedTheme = normalizeTheme(theme);
-        double score = 0.0;
+        // 4) Frequency / common-theme priors
+        score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0);
+        score += PandoraConfig.getInstance().getThemeFrequency(theme) * 0.5;
 
-        if (scan.symmetryX() > 0.72 || scan.symmetryZ() > 0.72) {
-            if (containsAny(normalizedTheme, "airplane", "butterfly", "glasses", "bow", "wings")) {
-                score += 6.0;
+        // 5) Single-block dominance bonus: tiny build of one signature block
+        if (fp.totalBlocks() <= 6 && fp.dominantBlockId() != null) {
+            for (String hint : GTBBlockSignatures.singleBlockThemes(fp.dominantBlockId())) {
+                if (key.equalsIgnoreCase(hint)) {
+                    score += SINGLE_BLOCK_LEAD_BONUS;
+                    break;
+                }
             }
         }
 
-        if (scan.isTall()) {
-            if (containsAny(normalizedTheme, "tree", "treehouse", "rocket", "tower", "cactus", "skyscraper")) {
-                score += 5.0;
-            }
-        }
-
-        if (scan.isFlat() && scan.isSquareish()) {
-            if (containsAny(normalizedTheme, "pizza", "coin", "clock", "sun", "ball", "button", "plate")) {
-                score += 5.0;
-            }
-        }
-
-        if (scan.isWide()) {
-            if (containsAny(normalizedTheme, "bridge", "airplane", "train", "traffic light")) {
-                score += 3.0;
-            }
+        // 6) Hint-pattern compatibility filter — strict
+        if (!lastHint.isBlank() && !hintMatchesTheme(lastHint, theme)) {
+            score *= 0.05;
         }
 
         return score;
     }
 
-    private double categoryScore(String theme, BlockScan scan) {
+    private double scoreProfile(GTBThemeProfiles.Profile profile, BuildFingerprint fp) {
         double score = 0.0;
 
-        if ((theme.contains("traffic") && theme.contains("light")) || theme.contains("signal")) {
-            score += triColorScore(scan, "red", "yellow", "green") * 1.8;
-            score += capped(scan.count("wool") + scan.count("terracotta") + scan.count("clay") + scan.count("glass"), 20) * 0.4;
+        if (profile.signatureBlock() != null) {
+            int count = fp.blockIdCount(profile.signatureBlock());
+            if (count > 0) {
+                score += 18.0;
+                if (fp.totalBlocks() <= 6) score += 10.0;
+                if (count == fp.totalBlocks()) score += 6.0;
+            }
         }
-
-        if (containsAny(theme, "swim", "pool", "ocean", "sea", "water")) {
-            score += capped(scan.count("water"), 80) * 0.35;
-            score += capped(scan.count("blue") + scan.count("cyan") + scan.count("prismarine") + scan.count("sand"), 40) * 0.2;
+        for (String color : profile.colors()) {
+            int count = fp.tokenCount(color);
+            if (count > 0) {
+                double frac = count / (double) Math.max(1, fp.totalBlocks());
+                score += 3.0 + frac * 6.0;
+            }
         }
-
-        if (containsAny(theme, "fire", "lava", "volcano", "nether")) {
-            score += capped(scan.count("lava") + scan.count("fire") + scan.count("netherrack"), 40) * 0.45;
-            score += capped(scan.count("red") + scan.count("orange") + scan.count("yellow") + scan.count("glowstone"), 60) * 0.18;
+        if (!profile.colors().isEmpty()) {
+            String dominant = fp.dominantColor();
+            if (dominant != null && profile.colors().contains(dominant)) score += 5.0;
         }
-
-        if (containsAny(theme, "snow", "ice", "winter", "frozen")) {
-            score += capped(scan.count("snow") + scan.count("ice") + scan.count("packed"), 60) * 0.35;
-            score += capped(scan.count("white") + scan.count("blue"), 40) * 0.15;
+        for (String material : profile.materials()) {
+            int count = fp.tokenCount(material);
+            if (count > 0) score += 2.0 + Math.min(count, 20) * 0.25;
         }
-
-        if (containsAny(theme, "treehouse")) {
-            score += capped(scan.count("log") + scan.count("planks") + scan.count("wood"), 70) * 0.28;
-            score += capped(scan.count("leaves") + scan.count("green") + scan.count("fence"), 50) * 0.08;
-        } else if (containsAny(theme, "tree", "forest", "jungle", "plant", "garden")) {
-            score += capped(scan.count("log") + scan.count("leaves") + scan.count("sapling"), 60) * 0.3;
-            score += capped(scan.count("green") + scan.count("grass") + scan.count("dirt"), 50) * 0.18;
+        for (GTBThemeProfiles.Shape shape : profile.shapes()) {
+            if (matchesShape(shape, fp)) score += 4.0;
         }
-
-        if (containsAny(theme, "house", "home", "hut", "cabin")) {
-            score += capped(scan.count("planks") + scan.count("wood") + scan.count("log") + scan.count("brick"), 60) * 0.2;
-            score += capped(scan.count("glass") + scan.count("door") + scan.count("stairs") + scan.count("fence"), 40) * 0.18;
+        if (profile.minBlocks() > 0 && fp.totalBlocks() < profile.minBlocks()) {
+            score *= 0.6;
         }
-
-        if (containsAny(theme, "beach", "desert", "sand")) {
-            score += capped(scan.count("sand") + scan.count("sandstone"), 80) * 0.28;
-            score += capped(scan.count("water") + scan.count("cactus"), 40) * 0.14;
+        if (profile.maxBlocks() > 0 && fp.totalBlocks() > profile.maxBlocks()) {
+            score *= 0.4;
         }
-
-        if (containsAny(theme, "fries", "fry", "chips", "potato")) {
-            score += capped(scan.count("yellow") + scan.count("orange"), 60) * 0.3;
-            score += capped(scan.count("wool") + scan.count("terracotta") + scan.count("glass"), 40) * 0.16;
-        }
-
-        if (containsAny(theme, "pizza", "burger", "hotdog", "taco", "sandwich")) {
-            score += capped(scan.count("red") + scan.count("orange") + scan.count("yellow") + scan.count("brown"), 70) * 0.24;
-            score += capped(scan.count("wool") + scan.count("terracotta") + scan.count("clay"), 40) * 0.15;
-        }
-
-        if (containsAny(theme, "juice", "drink", "soda", "smoothie", "milkshake", "cocktail")) {
-            score += capped(scan.count("glass") + scan.count("pane") + scan.count("water"), 60) * 0.26;
-            score += capped(scan.count("orange") + scan.count("yellow") + scan.count("red") + scan.count("lime"), 50) * 0.16;
-        }
-
-        if (containsAny(theme, "cloud", "smoke")) {
-            score += capped(scan.count("white") + scan.count("snow") + scan.count("glass") + scan.count("wool"), 60) * 0.25;
-        }
-
-        if (containsAny(theme, "calculator", "computer", "keyboard", "phone", "remote")) {
-            score += capped(scan.count("gray") + scan.count("grey") + scan.count("black") + scan.count("stone") + scan.count("button"), 80) * 0.24;
-            score += capped(scan.count("glass") + scan.count("quartz") + scan.count("iron"), 40) * 0.12;
-        }
-
         return score;
     }
 
-    private double directSemanticScore(String theme, BlockScan scan) {
-        double score = 0.0;
-
-        if (theme.equals("crafting table")) {
-            score += capped(scan.count("crafting_table") * 5 + scan.count("crafting") * 3 + scan.count("table") * 2, 30);
-        }
-        if (theme.equals("calculator")) {
-            score += capped(scan.count("button") + scan.count("stone") + scan.count("gray") + scan.count("black"), 30) * 0.7;
-        }
-        if (theme.equals("cloud")) {
-            score += capped(scan.count("white") + scan.count("glass") + scan.count("snow"), 30) * 0.55;
-        }
-
-        return score;
+    private static boolean matchesShape(GTBThemeProfiles.Shape shape, BuildFingerprint fp) {
+        return switch (shape) {
+            case FLAT -> fp.isFlat();
+            case FLAT_ROUND -> fp.isFlat() && fp.isRoundish();
+            case TALL -> fp.isTall();
+            case TALL_NARROW -> fp.isTall() && fp.maxFootprint() <= 5;
+            case WIDE -> fp.isWide();
+            case SYMMETRIC -> fp.symmetryX() > 0.65 || fp.symmetryZ() > 0.65;
+            case BIG -> fp.totalBlocks() >= 60;
+        };
     }
 
-    private void sendPreHintSuggestion(String englishWord) {
+    private boolean hintMatchesTheme(String hint, String theme) {
+        if (hint.length() != theme.length()) return false;
+        long hintSpaces = hint.chars().filter(c -> c == ' ').count();
+        long themeSpaces = theme.chars().filter(c -> c == ' ').count();
+        if (hintSpaces != themeSpaces) return false;
+        String lowerTheme = theme.toLowerCase(Locale.ROOT);
+        for (int i = 0; i < hint.length(); i++) {
+            char h = hint.charAt(i);
+            if (h == '_' || h == ' ') continue;
+            if (lowerTheme.charAt(i) != h) return false;
+        }
+        return true;
+    }
+
+    private void sendScannerSuggestion(String englishWord) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null) {
-            return;
-        }
-
+        if (client.player == null) return;
         client.player.sendMessage(prefix()
-                .append(Text.literal("GTB pre-hint guess: ").formatted(Formatting.GREEN))
+                .append(Text.literal("scanner: ").formatted(Formatting.GREEN))
                 .append(createCopyableAnswer(englishWord, Formatting.YELLOW)), false);
     }
 
     private Text createSuggestionEntry(String englishWord) {
         String shortestTranslation = getShortestTranslation(englishWord);
-
         MutableText entry = Text.literal(" > ").formatted(Formatting.DARK_GRAY)
                 .append(createCopyableAnswer(englishWord, Formatting.YELLOW));
-
         if (!shortestTranslation.equalsIgnoreCase(englishWord)) {
             entry.append(Text.literal(" (" + shortestTranslation + ")").formatted(Formatting.GRAY));
         }
-
         return entry;
     }
 
     private MutableText createCopyableAnswer(String englishWord, Formatting color) {
         String shortestTranslation = getShortestTranslation(englishWord);
         MutableText answer = Text.literal(englishWord.toLowerCase(Locale.ROOT)).formatted(color);
-
         return answer.setStyle(answer.getStyle()
                 .withClickEvent(new ClickEvent.CopyToClipboard(shortestTranslation))
                 .withHoverEvent(new HoverEvent.ShowText(Text.literal("Click to copy: " + shortestTranslation).formatted(Formatting.GRAY))));
@@ -1020,11 +946,11 @@ public class GTBSolverEngine {
         return Text.literal("[Pandora] ").formatted(Formatting.LIGHT_PURPLE);
     }
 
+    // ===================== Game context (scoreboard + chat) =====================
+
     private GameContext readGameContext() {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.world == null || client.player == null) {
-            return GameContext.inactive();
-        }
+        if (client.world == null || client.player == null) return GameContext.inactive();
 
         Scoreboard scoreboard = client.world.getScoreboard();
         ScoreboardObjective sidebar = scoreboard.getObjectiveForSlot(ScoreboardDisplaySlot.SIDEBAR);
@@ -1044,8 +970,10 @@ public class GTBSolverEngine {
         boolean recentBuilder = now - lastBuilderSignalAt < ROUND_SIGNAL_GRACE_MS;
         boolean recentHint = now - lastHintSignalAt < ROUND_SIGNAL_GRACE_MS;
 
-        boolean scoreboardGtb = title.contains("guess the build") || lines.stream().anyMatch(line -> line.contains("guess the build"));
-        boolean inGuessTheBuild = scoreboardGtb || ((recentRound || recentHint) && recentBuilder);
+        boolean scoreboardGtb = title.contains("guess the build")
+                || lines.stream().anyMatch(line -> line.contains("guess the build"));
+        boolean inGuessTheBuild = scoreboardGtb || ((recentRound || recentHint) && recentBuilder)
+                || (recentRound && recentHint);
 
         String builderLine = findLine(lines, "builder");
         String timeLine = findLine(lines, "time");
@@ -1056,8 +984,8 @@ public class GTBSolverEngine {
         boolean hasBuilderSignal = builderLine != null || recentBuilder;
         boolean hasRoundSignal = roundLine != null || recentRound;
         boolean hasTimeSignal = timeLine != null;
-        boolean activeRound = inGuessTheBuild && ((hasBuilderSignal && hasRoundSignal) || (hasBuilderSignal && hasTimeSignal) || recentHint);
-        boolean allowPreHint = activeRound && (themeLine == null || themeLine.contains("???")) && lastHint.isBlank();
+        boolean activeRound = inGuessTheBuild && ((hasBuilderSignal && hasRoundSignal)
+                || (hasBuilderSignal && hasTimeSignal) || recentHint || recentRound);
         boolean revealedThemeVisible = !visibleTheme.isBlank() && !visibleTheme.contains("?") && !visibleTheme.contains("_");
 
         String roundKey = activeRound
@@ -1067,125 +995,7 @@ public class GTBSolverEngine {
                 themeLine != null ? themeLine : lastThemeLabel)
                 : "";
 
-        PlotAnchor plotAnchor = lastPlotAnchor;
-        if (activeRound && (!plotAnchor.isValid() || now - lastPlotSearchAt >= PLOT_SEARCH_INTERVAL_MS)) {
-            plotAnchor = detectPlotAnchor(client).orElse(lastPlotAnchor);
-            if (plotAnchor.isValid()) {
-                lastPlotAnchor = plotAnchor;
-            }
-        }
-
-        return new GameContext(
-                inGuessTheBuild,
-                activeRound,
-                allowPreHint,
-                roundKey,
-                plotAnchor,
-                revealedThemeVisible
-        );
-    }
-
-    private Optional<PlotAnchor> detectPlotAnchor(MinecraftClient client) {
-        if (client == null || client.world == null || client.player == null) {
-            return Optional.empty();
-        }
-
-        long now = System.currentTimeMillis();
-        if (lastPlotAnchor.isValid() && now - lastPlotSearchAt < PLOT_SEARCH_INTERVAL_MS) {
-            return Optional.of(lastPlotAnchor);
-        }
-        lastPlotSearchAt = now;
-
-        List<BlockPos> searchOrigins = new ArrayList<>();
-        BlockPos playerPos = client.player.getBlockPos();
-        searchOrigins.add(playerPos);
-
-        Vec3d look = client.player.getRotationVecClient();
-        Vec3d horizontal = new Vec3d(look.x, 0.0, look.z);
-        if (horizontal.lengthSquared() > 1.0E-4) {
-            Vec3d ahead = horizontal.normalize().multiply(22.0);
-            searchOrigins.add(BlockPos.ofFloored(client.player.getX() + ahead.x, client.player.getY(), client.player.getZ() + ahead.z));
-        }
-
-        PlotAnchor best = null;
-        for (BlockPos origin : searchOrigins) {
-            Optional<PlotAnchor> candidate = detectPlotAnchorAround(client, origin);
-            if (candidate.isEmpty()) {
-                continue;
-            }
-            if (best == null || candidate.get().confidence() > best.confidence()) {
-                best = candidate.get();
-            }
-        }
-
-        if (best == null) {
-            return Optional.ofNullable(lastPlotAnchor.isValid() ? lastPlotAnchor : null);
-        }
-
-        lastPlotAnchor = best;
-        return Optional.of(best);
-    }
-
-    private Optional<PlotAnchor> detectPlotAnchorAround(MinecraftClient client, BlockPos origin) {
-        int bestY = Integer.MIN_VALUE;
-        int bestCount = 0;
-        for (int y = origin.getY() - PLOT_SEARCH_VERTICAL; y <= origin.getY() + PLOT_SEARCH_VERTICAL; y++) {
-            int count = 0;
-            for (int x = origin.getX() - PLOT_SEARCH_RADIUS; x <= origin.getX() + PLOT_SEARCH_RADIUS; x++) {
-                for (int z = origin.getZ() - PLOT_SEARCH_RADIUS; z <= origin.getZ() + PLOT_SEARCH_RADIUS; z++) {
-                    if (isWhiteTerracotta(client.world.getBlockState(new BlockPos(x, y, z)))) {
-                        count++;
-                    }
-                }
-            }
-            if (count > bestCount) {
-                bestCount = count;
-                bestY = y;
-            }
-        }
-
-        if (bestCount < MIN_WHITE_TERRACOTTA_FLOOR_BLOCKS) {
-            return Optional.empty();
-        }
-
-        int minX = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE;
-        int minZ = Integer.MAX_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        int totalX = 0;
-        int totalZ = 0;
-        int totalBlocks = 0;
-        for (int x = origin.getX() - PLOT_SEARCH_RADIUS; x <= origin.getX() + PLOT_SEARCH_RADIUS; x++) {
-            for (int z = origin.getZ() - PLOT_SEARCH_RADIUS; z <= origin.getZ() + PLOT_SEARCH_RADIUS; z++) {
-                if (!isWhiteTerracotta(client.world.getBlockState(new BlockPos(x, bestY, z)))) {
-                    continue;
-                }
-                minX = Math.min(minX, x);
-                maxX = Math.max(maxX, x);
-                minZ = Math.min(minZ, z);
-                maxZ = Math.max(maxZ, z);
-                totalX += x;
-                totalZ += z;
-                totalBlocks++;
-            }
-        }
-
-        if (totalBlocks < MIN_WHITE_TERRACOTTA_FLOOR_BLOCKS) {
-            return Optional.empty();
-        }
-
-        int spanX = maxX - minX;
-        int spanZ = maxZ - minZ;
-        if (totalBlocks > MAX_WHITE_TERRACOTTA_FLOOR_BLOCKS || spanX > MAX_PLOT_SPAN || spanZ > MAX_PLOT_SPAN) {
-            return Optional.empty();
-        }
-        int centerX = spanX >= PLOT_HALF_SIZE ? Math.round((minX + maxX) / 2.0f) : Math.round(totalX / (float) totalBlocks);
-        int centerZ = spanZ >= PLOT_HALF_SIZE ? Math.round((minZ + maxZ) / 2.0f) : Math.round(totalZ / (float) totalBlocks);
-        double confidence = 900.0
-                - Math.abs(totalBlocks - 729)
-                - Math.abs(spanX - PLOT_HALF_SIZE * 2) * 8.0
-                - Math.abs(spanZ - PLOT_HALF_SIZE * 2) * 8.0;
-        return Optional.of(new PlotAnchor(new BlockPos(centerX, bestY, centerZ), bestY, confidence));
+        return new GameContext(inGuessTheBuild, activeRound, roundKey, revealedThemeVisible);
     }
 
     private String scoreboardLine(ScoreboardEntry entry) {
@@ -1195,12 +1005,10 @@ public class GTBSolverEngine {
     }
 
     private String findLine(List<String> lines, String prefix) {
-        String loweredPrefix = prefix.toLowerCase(Locale.ROOT);
+        String lp = prefix.toLowerCase(Locale.ROOT);
         for (String line : lines) {
             String compact = line.replace(" ", "");
-            if (compact.startsWith(loweredPrefix + ":")) {
-                return line;
-            }
+            if (compact.startsWith(lp + ":")) return line;
         }
         return null;
     }
@@ -1209,121 +1017,48 @@ public class GTBSolverEngine {
         activeRoundKey = context.roundKey();
         lastHint = "";
         lastResults = new ArrayList<>();
-        lastPreHintGuess = "";
-        lastPreHintTheme = "";
-        latestPreHintScores.clear();
-        pendingPlotUpdates.clear();
-        trackedPlotBlocks.clear();
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
         autoGuessQueue.clear();
-        guessHistory.clear();
         autoGuessIndex = 0;
         lastAutoGuessAt = 0L;
-        captureRoundBaseline(context.plotAnchor());
-    }
-
-    private void captureRoundBaseline(PlotAnchor anchor) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.world == null || !anchor.isValid()) {
-            roundBaselineBlocks = new HashMap<>();
-            return;
-        }
-
-        BlockPos center = anchor.center();
-        Map<Long, String> baseline = new HashMap<>();
-        int minX = center.getX() - PLOT_HALF_SIZE;
-        int maxX = center.getX() + PLOT_HALF_SIZE;
-        int minY = anchor.floorY() + PLOT_SCAN_MIN_Y;
-        int maxY = anchor.floorY() + PLOT_SCAN_MAX_Y;
-        int minZ = center.getZ() - PLOT_HALF_SIZE;
-        int maxZ = center.getZ() + PLOT_HALF_SIZE;
-
-        for (BlockPos pos : BlockPos.iterate(minX, minY, minZ, maxX, maxY, maxZ)) {
-            BlockState state = client.world.getBlockState(pos);
-            baseline.put(pos.asLong(), Registries.BLOCK.getId(state.getBlock()).getPath());
-        }
-
-        roundBaselineBlocks = baseline;
-        reconcilePendingPlotUpdates();
-    }
-
-    private void reconcilePendingPlotUpdates() {
-        if (roundBaselineBlocks.isEmpty() || pendingPlotUpdates.isEmpty()) {
-            return;
-        }
-
-        for (Map.Entry<Long, String> entry : pendingPlotUpdates.entrySet()) {
-            long packedPos = entry.getKey();
-            String blockId = entry.getValue();
-            String baseline = roundBaselineBlocks.get(packedPos);
-            if (blockId.isBlank()
-                    || baseline == null
-                    || blockId.equals(baseline)
-                    || isIgnoredBuildBlock(blockId)) {
-                trackedPlotBlocks.remove(packedPos);
-            } else {
-                trackedPlotBlocks.put(packedPos, blockId);
-            }
-        }
-
-        pendingPlotUpdates.clear();
+        // Re-anchor the plot at next opportunity for the new round.
+        plotRegion = null;
+        baseline.clear();
+        placed.clear();
+        hudPlacedCount = 0;
     }
 
     private void clearAutomationState() {
         autoGuessQueue.clear();
         autoGuessIndex = 0;
         guessHistory.clear();
-        latestPreHintScores.clear();
-        trackedPlotBlocks.clear();
-        lastPreHintGuess = "";
-        lastPreHintTheme = "";
+        plotRegion = null;
+        baseline.clear();
+        placed.clear();
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
         activeRoundKey = "";
-        lastHudStatus = "waiting for GTB round";
-        lastChangedBlockCount = 0;
-        roundBaselineBlocks = new HashMap<>();
-        pendingPlotUpdates.clear();
+        hudStatus = "waiting for GTB round";
+        hudPlacedCount = 0;
         lastAutoGuessAt = 0L;
     }
 
-    public String getShortestTranslation(String englishWord) {
-        return shortestTranslationMap.getOrDefault(englishWord.toLowerCase(Locale.ROOT), englishWord);
-    }
-
-    public List<String> getThemeWords() {
-        return Collections.unmodifiableList(themeWords);
-    }
+    // ===================== Helpers =====================
 
     private String extractValueAfterColon(String message, String prefix) {
-        String loweredMessage = message.toLowerCase(Locale.ROOT);
-        String loweredPrefix = prefix.toLowerCase(Locale.ROOT) + ":";
-        int start = loweredMessage.indexOf(loweredPrefix);
-        if (start < 0) {
-            return "";
-        }
-        return clean(message.substring(start + loweredPrefix.length()));
+        String lm = message.toLowerCase(Locale.ROOT);
+        String lp = prefix.toLowerCase(Locale.ROOT) + ":";
+        int start = lm.indexOf(lp);
+        if (start < 0) return "";
+        return clean(message.substring(start + lp.length()));
     }
 
-    private boolean isWhiteTerracotta(BlockState state) {
-        String blockId = Registries.BLOCK.getId(state.getBlock()).getPath();
-        return "white_terracotta".equals(blockId)
-                || "hardened_clay".equals(blockId)
-                || "white_stained_hardened_clay".equals(blockId);
-    }
-
-    private boolean isIgnoredBuildBlock(String blockId) {
-        return ABSOLUTE_SCAN_IGNORES.contains(blockId);
-    }
-
-    private boolean isWithinTrackedPlot(BlockPos pos, PlotAnchor anchor) {
-        if (!anchor.isValid()) {
-            return false;
-        }
-        BlockPos center = anchor.center();
-        return pos.getX() >= center.getX() - PLOT_HALF_SIZE
-                && pos.getX() <= center.getX() + PLOT_HALF_SIZE
-                && pos.getZ() >= center.getZ() - PLOT_HALF_SIZE
-                && pos.getZ() <= center.getZ() + PLOT_HALF_SIZE
-                && pos.getY() >= anchor.floorY() + PLOT_SCAN_MIN_Y
-                && pos.getY() <= anchor.floorY() + PLOT_SCAN_MAX_Y;
+    private static boolean isWhiteTerracotta(BlockState state) {
+        String id = Registries.BLOCK.getId(state.getBlock()).getPath();
+        return "white_terracotta".equals(id) || "hardened_clay".equals(id) || "white_stained_hardened_clay".equals(id);
     }
 
     private static String clean(String value) {
@@ -1338,54 +1073,37 @@ public class GTBSolverEngine {
         return value.codePointCount(0, value.length());
     }
 
-    private static String normalizeTheme(String value) {
-        return value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").trim();
-    }
-
-    private static boolean containsAny(String value, String... needles) {
-        for (String needle : needles) {
-            if (value.contains(needle)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static double triColorScore(BlockScan scan, String first, String second, String third) {
-        return Math.min(capped(scan.count(first), 30), Math.min(capped(scan.count(second), 30), capped(scan.count(third), 30)));
-    }
-
-    private static double capped(int value, int cap) {
-        return Math.min(value, cap);
-    }
+    // ===================== Inner types =====================
 
     private record ScoredTheme(String theme, double score) {
     }
 
-    private record PlotAnchor(BlockPos center, int floorY, double confidence) {
-        private static PlotAnchor unknown() {
-            return new PlotAnchor(BlockPos.ORIGIN, 0, Double.NEGATIVE_INFINITY);
-        }
-
-        private boolean isValid() {
-            return confidence > Double.NEGATIVE_INFINITY / 2.0;
-        }
-
-        private PlotAnchor shift(int xShift, int zShift) {
-            return new PlotAnchor(center.add(xShift, 0, zShift), floorY, confidence - Math.abs(xShift) - Math.abs(zShift));
-        }
-    }
-
-    private record GameContext(boolean inGuessTheBuild, boolean activeRound, boolean allowPreHint, String roundKey, PlotAnchor plotAnchor, boolean revealedThemeVisible) {
+    private record GameContext(boolean inGuessTheBuild, boolean activeRound, String roundKey, boolean revealedThemeVisible) {
         private static GameContext inactive() {
-            return new GameContext(false, false, false, "", PlotAnchor.unknown(), false);
+            return new GameContext(false, false, "", false);
         }
     }
 
-    private static class BlockScan {
+    private record PlotRegion(int centerX, int floorY, int centerZ) {
+        boolean contains(BlockPos pos) {
+            return pos.getX() >= centerX - PLOT_HALF_SIZE
+                    && pos.getX() <= centerX + PLOT_HALF_SIZE
+                    && pos.getZ() >= centerZ - PLOT_HALF_SIZE
+                    && pos.getZ() <= centerZ + PLOT_HALF_SIZE
+                    && pos.getY() >= floorY - PLOT_SCAN_BELOW
+                    && pos.getY() <= floorY + PLOT_SCAN_ABOVE;
+        }
+    }
+
+    /**
+     * Aggregated stats for the currently placed blocks within a plot region.
+     */
+    private static final class BuildFingerprint {
+        private final Map<String, Integer> blockIdCounts = new HashMap<>();
         private final Map<String, Integer> tokenCounts = new HashMap<>();
+        private final Map<String, Integer> singleBlockThemeHits = new HashMap<>();
         private final Set<Long> positions = new HashSet<>();
-        private final BlockPos center;
+        private final PlotRegion region;
         private int totalBlocks;
         private int minX = Integer.MAX_VALUE;
         private int maxX = Integer.MIN_VALUE;
@@ -1393,14 +1111,26 @@ public class GTBSolverEngine {
         private int maxY = Integer.MIN_VALUE;
         private int minZ = Integer.MAX_VALUE;
         private int maxZ = Integer.MIN_VALUE;
+        private String dominantBlockId;
+        private String dominantColor;
 
-        private BlockScan(BlockPos center) {
-            this.center = center;
+        private BuildFingerprint(PlotRegion region) {
+            this.region = region;
         }
 
-        private void add(BlockPos pos, String blockPath) {
+        static BuildFingerprint fromPlaced(Map<Long, String> placed, PlotRegion region) {
+            BuildFingerprint fp = new BuildFingerprint(region);
+            for (Map.Entry<Long, String> entry : placed.entrySet()) {
+                BlockPos pos = BlockPos.fromLong(entry.getKey());
+                fp.add(pos, entry.getValue());
+            }
+            fp.finalizeStats();
+            return fp;
+        }
+
+        private void add(BlockPos pos, String blockId) {
             totalBlocks++;
-            positions.add(pack(pos.getX(), pos.getY(), pos.getZ()));
+            positions.add(pos.asLong());
             minX = Math.min(minX, pos.getX());
             maxX = Math.max(maxX, pos.getX());
             minY = Math.min(minY, pos.getY());
@@ -1408,119 +1138,141 @@ public class GTBSolverEngine {
             minZ = Math.min(minZ, pos.getZ());
             maxZ = Math.max(maxZ, pos.getZ());
 
-            addToken(blockPath);
-            for (String part : blockPath.split("_")) {
-                addToken(part);
+            blockIdCounts.merge(blockId, 1, Integer::sum);
+            for (String token : GTBBlockSignatures.tokenize(blockId)) {
+                tokenCounts.merge(token, 1, Integer::sum);
             }
-
-            if (blockPath.endsWith("_stained_hardened_clay") || blockPath.endsWith("_terracotta")) {
-                addToken("terracotta");
-                addToken("clay");
-            }
-            if (blockPath.endsWith("_stained_glass") || blockPath.endsWith("_stained_glass_pane")) {
-                addToken("glass");
-            }
-            if (blockPath.endsWith("_wool") || blockPath.endsWith("_carpet")) {
-                addToken("wool");
-            }
-            if (blockPath.contains("log") || blockPath.contains("planks")) {
-                addToken("wood");
-            }
-            if (blockPath.contains("leaves")) {
-                addToken("green");
+            for (String themeHint : GTBBlockSignatures.singleBlockThemes(blockId)) {
+                singleBlockThemeHits.merge(themeHint.toLowerCase(Locale.ROOT), 1, Integer::sum);
             }
         }
 
-        private void addToken(String token) {
-            tokenCounts.merge(token, 1, Integer::sum);
+        private void finalizeStats() {
+            int bestCount = 0;
+            for (Map.Entry<String, Integer> e : blockIdCounts.entrySet()) {
+                if (e.getValue() > bestCount) {
+                    bestCount = e.getValue();
+                    dominantBlockId = e.getKey();
+                }
+            }
+            int bestColorCount = 0;
+            for (String color : GTBBlockSignatures.COLOR_TOKENS) {
+                Integer c = tokenCounts.get(color);
+                if (c != null && c > bestColorCount) {
+                    bestColorCount = c;
+                    dominantColor = color;
+                }
+            }
+            // Collapse silver→gray if both present (1.8.9 light_gray reads as silver).
+            if ("silver".equals(dominantColor)) dominantColor = "gray";
         }
 
-        private int count(String token) {
+        int totalBlocks() {
+            return totalBlocks;
+        }
+
+        int tokenCount(String token) {
             return tokenCounts.getOrDefault(token, 0);
         }
 
-        private int width() {
+        int blockIdCount(String id) {
+            return blockIdCounts.getOrDefault(id, 0);
+        }
+
+        Set<String> tokens() {
+            return tokenCounts.keySet();
+        }
+
+        Set<String> singleBlockThemeHints() {
+            return singleBlockThemeHits.keySet();
+        }
+
+        int singleBlockThemeHitCount(String themeKey) {
+            return singleBlockThemeHits.getOrDefault(themeKey, 0);
+        }
+
+        String dominantBlockId() {
+            return dominantBlockId;
+        }
+
+        String dominantColor() {
+            return dominantColor;
+        }
+
+        int width() {
             return maxX >= minX ? maxX - minX + 1 : 0;
         }
 
-        private int depth() {
+        int depth() {
             return maxZ >= minZ ? maxZ - minZ + 1 : 0;
         }
 
-        private int height() {
+        int height() {
             return maxY >= minY ? maxY - minY + 1 : 0;
         }
 
-        private boolean isTall() {
+        int maxFootprint() {
+            return Math.max(width(), depth());
+        }
+
+        boolean isFlat() {
+            return height() <= 3;
+        }
+
+        boolean isTall() {
             return height() >= Math.max(width(), depth()) && height() >= 6;
         }
 
-        private boolean isFlat() {
-            return height() <= 4;
+        boolean isWide() {
+            return Math.max(width(), depth()) >= 9 && height() <= 6;
         }
 
-        private boolean isWide() {
-            return Math.max(width(), depth()) >= 10 && height() <= 8;
-        }
-
-        private boolean isSquareish() {
-            int width = width();
-            int depth = depth();
-            return width > 0 && depth > 0 && Math.abs(width - depth) <= 3;
-        }
-
-        private double symmetryX() {
-            if (positions.isEmpty()) {
-                return 0.0;
+        boolean isRoundish() {
+            int w = width();
+            int d = depth();
+            if (w < 4 || d < 4 || Math.abs(w - d) > 2) return false;
+            // Project to XZ plane: count unique (x,z) positions, then check that the
+            // 4 corners of the bounding box are NOT placed (a circle inscribed in a
+            // square leaves the corners empty).
+            Set<Long> xz = new HashSet<>();
+            for (long packed : positions) {
+                BlockPos p = BlockPos.fromLong(packed);
+                xz.add(((long) p.getX() << 32) | (p.getZ() & 0xFFFFFFFFL));
             }
+            long c1 = ((long) minX << 32) | (minZ & 0xFFFFFFFFL);
+            long c2 = ((long) minX << 32) | (maxZ & 0xFFFFFFFFL);
+            long c3 = ((long) maxX << 32) | (minZ & 0xFFFFFFFFL);
+            long c4 = ((long) maxX << 32) | (maxZ & 0xFFFFFFFFL);
+            int filledCorners = 0;
+            if (xz.contains(c1)) filledCorners++;
+            if (xz.contains(c2)) filledCorners++;
+            if (xz.contains(c3)) filledCorners++;
+            if (xz.contains(c4)) filledCorners++;
+            return filledCorners <= 1;
+        }
 
-            double mirror = center.getX();
+        double symmetryX() {
+            if (positions.isEmpty()) return 0.0;
+            double mirror = (minX + maxX) / 2.0;
             int matches = 0;
             for (long packed : positions) {
-                int x = unpackX(packed);
-                int y = unpackY(packed);
-                int z = unpackZ(packed);
-                int reflectedX = (int) Math.round(mirror - (x - mirror));
-                if (positions.contains(pack(reflectedX, y, z))) {
-                    matches++;
-                }
+                BlockPos p = BlockPos.fromLong(packed);
+                int reflectedX = (int) Math.round(2 * mirror - p.getX());
+                if (positions.contains(new BlockPos(reflectedX, p.getY(), p.getZ()).asLong())) matches++;
             }
             return matches / (double) positions.size();
         }
 
-        private double symmetryZ() {
-            if (positions.isEmpty()) {
-                return 0.0;
-            }
-
-            double mirror = center.getZ();
+        double symmetryZ() {
+            if (positions.isEmpty()) return 0.0;
+            double mirror = (minZ + maxZ) / 2.0;
             int matches = 0;
             for (long packed : positions) {
-                int x = unpackX(packed);
-                int y = unpackY(packed);
-                int z = unpackZ(packed);
-                int reflectedZ = (int) Math.round(mirror - (z - mirror));
-                if (positions.contains(pack(x, y, reflectedZ))) {
-                    matches++;
-                }
+                BlockPos p = BlockPos.fromLong(packed);
+                int reflectedZ = (int) Math.round(2 * mirror - p.getZ());
+                if (positions.contains(new BlockPos(p.getX(), p.getY(), reflectedZ).asLong())) matches++;
             }
             return matches / (double) positions.size();
-        }
-
-        private static long pack(int x, int y, int z) {
-            return (((long) x) & 0x3FFFFFFL) << 38 | ((((long) z) & 0x3FFFFFFL) << 12) | (((long) y) & 0xFFFL);
-        }
-
-        private static int unpackX(long packed) {
-            return (int) (packed >> 38);
-        }
-
-        private static int unpackY(long packed) {
-            return (int) (packed << 52 >> 52);
-        }
-
-        private static int unpackZ(long packed) {
-            return (int) (packed << 26 >> 38);
         }
     }
 }

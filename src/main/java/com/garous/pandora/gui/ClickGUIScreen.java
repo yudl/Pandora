@@ -23,13 +23,14 @@ import java.util.Map;
  */
 public class ClickGUIScreen extends Screen {
 
-    private static final int PANEL_WIDTH = 138;
+    private static final int PANEL_WIDTH = 150;
     private static final int HEADER_HEIGHT = 19;
     private static final int MODULE_HEIGHT = 17;
-    private static final int SETTING_HEIGHT = 16;
+    private static final int SETTING_HEIGHT = 14;
     private static final int INDENT = 9;
-    private static final float SCREEN_ANIMATION_SPEED = 9.0f;
-    private static final float PANEL_ANIMATION_SPEED = 30.0f;
+    private static final float SCREEN_ANIMATION_SPEED = 14.0f;
+    // 720 px/s — a 4-row dropdown opens in ~80 ms instead of 2+ seconds.
+    private static final float PANEL_ANIMATION_SPEED = 720.0f;
 
     private static final int COLOR_OVERLAY = 0xAA050509;
     private static final int COLOR_PANEL_BG = 0xEE101014;

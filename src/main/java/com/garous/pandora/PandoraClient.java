@@ -3,7 +3,9 @@ package com.garous.pandora;
 import com.garous.pandora.gui.ClickGUIScreen;
 import com.garous.pandora.gui.GTBGuessHistoryHud;
 import com.garous.pandora.config.PandoraConfig;
+import com.garous.pandora.module.Module;
 import com.garous.pandora.module.ModuleManager;
+import com.garous.pandora.module.modules.HudModule;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
@@ -54,6 +56,10 @@ public class PandoraClient implements ClientModInitializer {
 
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> PandoraConfig.getInstance().save());
         HudRenderCallback.EVENT.register(GTBGuessHistoryHud::render);
+        HudRenderCallback.EVENT.register((context, tickCounter) -> {
+            Module hud = ModuleManager.getInstance().getModule("hud");
+            if (hud instanceof HudModule hudModule) hudModule.render(context);
+        });
 
         Pandora.LOGGER.info("[Pandora] Client initialized. Press Right Shift to open ClickGUI.");
     }

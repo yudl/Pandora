@@ -32,18 +32,18 @@ public class ClickGUIScreen extends Screen {
     // 720 px/s — a 4-row dropdown opens in ~80 ms instead of 2+ seconds.
     private static final float PANEL_ANIMATION_SPEED = 720.0f;
 
-    private static final int COLOR_OVERLAY = 0xAA050509;
-    private static final int COLOR_PANEL_BG = 0xEE101014;
-    private static final int COLOR_PANEL_BORDER = 0xAA282834;
-    private static final int COLOR_HEADER_BG = 0xFA18181D;
+    private static final int COLOR_OVERLAY = 0x88161620;
+    private static final int COLOR_PANEL_BG = 0xEE1B1B23;
+    private static final int COLOR_PANEL_BORDER = 0xAA3A3A4A;
+    private static final int COLOR_HEADER_BG = 0xFA22222B;
     private static final int COLOR_HEADER_TEXT = 0xFFFFFFFF;
     private static final int COLOR_MODULE_ENABLED = 0xFFFF4FD8;
     private static final int COLOR_MODULE_DISABLED = 0xFFE6E6EB;
     private static final int COLOR_MODULE_ENABLED_BG = 0x553A123A;
     private static final int COLOR_MODULE_HOVER = 0x45FF4FD8;
-    private static final int COLOR_MODULE_ROW = 0xD018181D;
-    private static final int COLOR_SETTING_BG = 0xCC121218;
-    private static final int COLOR_SETTING_ALT_BG = 0xCC16161D;
+    private static final int COLOR_MODULE_ROW = 0xD021212B;
+    private static final int COLOR_SETTING_BG = 0xCC1B1B24;
+    private static final int COLOR_SETTING_ALT_BG = 0xCC20202A;
     private static final int COLOR_ACCENT = 0xFFFF4FD8;
     private static final int COLOR_MUTED = 0xFF9292A3;
     private static final int COLOR_CHECKBOX = 0xFF23232E;
@@ -257,8 +257,19 @@ public class ClickGUIScreen extends Screen {
         }
     }
 
+    /**
+     * Accent colour used for the leading 'P' in the watermark. The HUD's
+     * ArrayList module updates this to its current colour so the logo stays
+     * in sync with the user's theme; until that module is enabled it
+     * falls back to the panel accent.
+     */
+    public static volatile int WATERMARK_P_COLOR = COLOR_ACCENT;
+
     private void renderWatermark(DrawContext context, float alpha) {
-        context.drawTextWithShadow(this.textRenderer, "Pandora B1", 5, 4, withAlpha(COLOR_ACCENT, alpha));
+        int pColor = withAlpha(WATERMARK_P_COLOR, alpha);
+        context.drawTextWithShadow(this.textRenderer, "P", 5, 4, pColor);
+        int pWidth = this.textRenderer.getWidth("P");
+        context.drawTextWithShadow(this.textRenderer, "andora B1", 5 + pWidth, 4, withAlpha(COLOR_ACCENT, alpha));
     }
 
     private void renderPanel(DrawContext context, Panel panel, int mouseX, int mouseY, float frameDelta, float alpha, int offsetY) {

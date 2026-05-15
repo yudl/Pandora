@@ -58,6 +58,9 @@ public class GTBSolverEngine {
     private static final Pattern THEME_HINT = Pattern.compile("(?i).*\\b(?:theme|hint|word)\\b(?:\\s+(?:is|starts\\s+with|contains))?\\s*:?[\\s-]*(.+)$");
     private static final Pattern THEME_REVEAL = Pattern.compile("(?i).*theme was\\s*:?[\\s-]*(.+?)(?:[!.]|$)");
     private static final Pattern ROUND_OF = Pattern.compile("(?i)round\\s*:?\\s*(\\d+)\\s*/\\s*(\\d+)");
+    // "+1 point" / "+2 points" / "+3 points" - Hypixel sends this to the
+    // player who guesses correctly, and only to them. Treat as a win signal.
+    private static final Pattern POINT_AWARD = Pattern.compile("(?i)\\+\\s*[123]\\s*points?\\b");
 
     private static final int MAX_DISPLAYED_MATCHES = 100;
     private static final long AUTO_GUESS_INTERVAL_MS = 3_000L;
@@ -841,7 +844,11 @@ public class GTBSolverEngine {
     private void clearAutoGuessOnRoundMessage(String message) {
         String lower = stripFormatting(message).toLowerCase(Locale.ROOT);
         if (lower.contains("_")) return;
-        boolean ownCorrect = lower.contains("you guessed") || lower.contains("you got it")
+        // "+1 point" / "+2 points" / "+3 points" - Hypixel only sends this
+        // for the local player's own correct guess, so it's the cleanest
+        // signal to lock the queue with.
+        boolean pointAwarded = POINT_AWARD.matcher(lower).find();
+        boolean ownCorrect = pointAwarded || lower.contains("you guessed") || lower.contains("you got it")
                 || ownPlayerGuessedCorrectly(lower);
         boolean roundEnded = ownCorrect || lower.contains("guessed the theme")
                 || lower.contains("the theme was") || lower.contains("round over")

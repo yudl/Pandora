@@ -61,6 +61,15 @@ public class GTBSolverEngine {
     // "+1 point" / "+2 points" / "+3 points" - Hypixel sends this to the
     // player who guesses correctly, and only to them. Treat as a win signal.
     private static final Pattern POINT_AWARD = Pattern.compile("(?i)\\+\\s*[123]\\s*points?\\b");
+    // Player chat lines from Hypixel look like:
+    //   [VIP] PlayerName: message
+    //   PlayerName: message
+    //   Guild > PlayerName: message
+    // We strip § codes first then test for an opening "<optional rank> <name>:"
+    // so a player typing "+1 point" never trips the win detector.
+    private static final Pattern PLAYER_CHAT_PREFIX = Pattern.compile(
+            "(?i)^(?:\\[[^\\]]+\\]\\s+)?(?:guild\\s*>\\s*)?(?:\\[[^\\]]+\\]\\s+)?[A-Za-z0-9_]{3,16}\\s*[:\\u00BB>]"
+    );
 
     private static final int MAX_DISPLAYED_MATCHES = 100;
     private static final long AUTO_GUESS_INTERVAL_MS = 3_000L;
@@ -194,6 +203,10 @@ public class GTBSolverEngine {
     private long automatedNextActionAt;
     private long lastWinnersSeenAt;
     private boolean awaitingBuilderTurn;
+    // Set true when we send /play after a Winners line; cleared only when we
+    // detect a fresh round beginning (so the second 'Winners' recap line
+    // Hypixel posts ~10s later doesn't cause a second /play).
+    private boolean awaitingNewGame;
 
     private enum AutomatedState {
         IDLE,
@@ -245,6 +258,7 @@ public class GTBSolverEngine {
         if (!enabled) {
             this.automatedState = AutomatedState.IDLE;
             this.awaitingBuilderTurn = false;
+            this.awaitingNewGame = false;
             this.automatedNextActionAt = 0L;
         }
     }
@@ -457,6 +471,7 @@ public class GTBSolverEngine {
         automatedState = AutomatedState.IDLE;
         automatedNextActionAt = 0L;
         awaitingBuilderTurn = false;
+        awaitingNewGame = false;
     }
 
     public String getShortestTranslation(String englishWord) {
@@ -832,6 +847,7 @@ public class GTBSolverEngine {
     private void noteGameSignal(String message) {
         String plain = stripFormatting(message).trim();
         String lower = plain.toLowerCase(Locale.ROOT);
+        boolean fromPlayer = looksLikePlayerChat(plain);
         long now = System.currentTimeMillis();
         if (lower.contains("guess the build") || lower.contains("builder:") || lower.contains("round:")
                 || lower.contains("theme:") || lower.contains("you guessed") || lower.contains("_")
@@ -858,7 +874,9 @@ public class GTBSolverEngine {
         // Automated farm hooks: detect when we are the builder this round
         // (Hypixel shows "You are the builder!" or "It's your turn to build")
         // and when a game ends (the "Winners" recap appears).
-        if (automatedMode) {
+        // We hard-skip these triggers if the line is a player chat message so
+        // someone typing 'Winners 1st' or '+1 point' can't drive the bot.
+        if (automatedMode && !fromPlayer) {
             if ((lower.contains("your turn to build")
                     || lower.contains("you are the builder")
                     || lower.contains("you are now building"))
@@ -870,6 +888,12 @@ public class GTBSolverEngine {
                 triggerRejoinIfAutomated();
             }
         }
+    }
+
+    /** True if this chat line was almost certainly authored by another player. */
+    private static boolean looksLikePlayerChat(String plain) {
+        if (plain == null || plain.isEmpty()) return false;
+        return PLAYER_CHAT_PREFIX.matcher(plain).find();
     }
 
     private void handleThemeReveal(String message) {
@@ -1035,24 +1059,29 @@ public class GTBSolverEngine {
 
     /**
      * Called from chat parsing when "Winners" or game-end signals appear.
-     * Schedules the /play rejoin.
+     * Schedules the /play rejoin exactly once per game-end - subsequent
+     * Winners recap lines (Hypixel posts them ~10s apart) are ignored
+     * until a fresh round starts and beginRound() clears awaitingNewGame.
      */
     private void triggerRejoinIfAutomated() {
         if (!automatedMode) return;
+        if (awaitingNewGame) return;
         long now = System.currentTimeMillis();
-        // Debounce - the server posts several winner lines back to back.
         if (now - lastWinnersSeenAt < 5_000L) return;
         lastWinnersSeenAt = now;
+        awaitingNewGame = true;
         automatedState = AutomatedState.AWAITING_REJOIN;
         automatedNextActionAt = now + 5_000L;
     }
 
     private void clearAutoGuessOnRoundMessage(String message) {
-        String lower = stripFormatting(message).toLowerCase(Locale.ROOT);
+        String plain = stripFormatting(message);
+        String lower = plain.toLowerCase(Locale.ROOT);
         if (lower.contains("_")) return;
-        // "+1 point" / "+2 points" / "+3 points" - Hypixel only sends this
-        // for the local player's own correct guess, so it's the cleanest
-        // signal to lock the queue with.
+        // Ignore lines that are clearly authored by another player. Without
+        // this, someone typing '+1 point' / 'you guessed' / 'game over' in
+        // chat could lock our auto-guesser for the rest of the round.
+        if (looksLikePlayerChat(plain)) return;
         boolean pointAwarded = POINT_AWARD.matcher(lower).find();
         boolean ownCorrect = pointAwarded || lower.contains("you guessed") || lower.contains("you got it")
                 || ownPlayerGuessedCorrectly(lower);
@@ -1517,6 +1546,8 @@ public class GTBSolverEngine {
         lastAutoGuessAt = 0L;
         lastSentGuess = "";
         roundGuessLocked = false;
+        // We're in a new round, so a future game-end can trigger /play once more.
+        awaitingNewGame = false;
         // Re-anchor the plot at next opportunity for the new round.
         plotRegion = null;
         baseline.clear();

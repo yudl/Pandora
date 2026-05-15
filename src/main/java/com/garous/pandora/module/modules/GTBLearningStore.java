@@ -38,8 +38,11 @@ public final class GTBLearningStore {
 
     private static final GTBLearningStore INSTANCE = new GTBLearningStore();
 
-    /** Cap per-theme detailed snapshots so the JSON file stays bounded. */
-    private static final int MAX_HISTORY_PER_THEME = 50;
+    /**
+     * Per-theme history is unbounded so the bot keeps learning indefinitely;
+     * every reveal contributes a new snapshot. Storage budget is enforced by
+     * disk only - the JSON grows linearly with rounds played per theme.
+     */
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     // Lives next to pandora.json under .minecraft/pandora/. The first-run
@@ -119,8 +122,8 @@ public final class GTBLearningStore {
     /**
      * Detailed variant: also stores the build's block layout (relative
      * coordinates -> block id) for the round, capped at the last
-     * MAX_HISTORY_PER_THEME rounds per theme. Lets future scoring inspect
-     * actual shapes, not just token frequencies.
+     * round of the theme - unbounded so the database keeps getting more
+     * accurate the more the bot plays.
      */
     public void recordRound(String theme, Map<String, Integer> tokenCounts, List<String> guessesSent,
                             Map<String, String> blockLayout) {
@@ -152,9 +155,7 @@ public final class GTBLearningStore {
             snapshot.blocks = new HashMap<>(blockLayout);
             if (guessesSent != null) snapshot.guesses = new ArrayList<>(guessesSent);
             entry.history.add(snapshot);
-            while (entry.history.size() > MAX_HISTORY_PER_THEME) {
-                entry.history.remove(0);
-            }
+            // No history cap - the more rounds the bot sees, the better.
         }
         save();
     }

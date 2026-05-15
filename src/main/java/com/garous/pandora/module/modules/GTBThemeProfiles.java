@@ -1016,6 +1016,66 @@ public final class GTBThemeProfiles {
                 Set.of("gold", "iron"),
                 List.of(Shape.FLAT_ROUND),
                 4, 0, null));
+        map.put("necklace", new Profile(
+                Set.of("yellow", "white"),
+                Set.of("gold", "wool", "quartz"),
+                List.of(Shape.SYMMETRIC),
+                6, 0, null));
+        map.put("crown", new Profile(
+                Set.of("yellow"),
+                Set.of("gold", "wool"),
+                List.of(Shape.SYMMETRIC, Shape.WIDE),
+                6, 0, null));
+        map.put("coin", new Profile(
+                Set.of("yellow"),
+                Set.of("gold", "wool"),
+                List.of(Shape.FLAT_ROUND),
+                4, 30, null));
+        map.put("gold ingot", new Profile(
+                Set.of("yellow"),
+                Set.of("gold"),
+                List.of(Shape.FLAT, Shape.WIDE),
+                4, 24, null));
+        map.put("key", new Profile(
+                Set.of("yellow", "gray"),
+                Set.of("gold", "iron"),
+                List.of(Shape.WIDE),
+                4, 30, null));
+        map.put("treasure", new Profile(
+                Set.of("yellow", "brown"),
+                Set.of("gold", "wood", "planks"),
+                List.of(),
+                8, 0, null));
+        map.put("treasure chest", new Profile(
+                Set.of("yellow", "brown"),
+                Set.of("gold", "wood", "planks", "chest"),
+                List.of(),
+                8, 0, null));
+        map.put("gold bar", new Profile(
+                Set.of("yellow"),
+                Set.of("gold"),
+                List.of(Shape.WIDE),
+                4, 20, null));
+        map.put("bell", new Profile(
+                Set.of("yellow"),
+                Set.of("gold", "wool"),
+                List.of(Shape.SYMMETRIC),
+                6, 0, null));
+        map.put("lamp", new Profile(
+                Set.of("yellow", "white"),
+                Set.of("glowstone", "lantern", "lamp", "torch"),
+                List.of(Shape.TALL_NARROW),
+                4, 0, null));
+        map.put("lantern", new Profile(
+                Set.of("yellow", "gray"),
+                Set.of("lantern", "iron", "glass"),
+                List.of(Shape.TALL_NARROW),
+                3, 0, null));
+        map.put("crown jewel", new Profile(
+                Set.of("yellow", "red", "blue", "purple"),
+                Set.of("gold", "wool"),
+                List.of(Shape.SYMMETRIC),
+                6, 0, null));
         map.put("trophy", new Profile(
                 Set.of("yellow"),
                 Set.of("gold", "wool"),

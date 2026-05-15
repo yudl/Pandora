@@ -36,6 +36,9 @@ public final class GTBLearningStore {
 
     private static final GTBLearningStore INSTANCE = new GTBLearningStore();
 
+    /** Cap per-theme detailed snapshots so the JSON file stays bounded. */
+    private static final int MAX_HISTORY_PER_THEME = 50;
+
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final Path filePath = FabricLoader.getInstance().getConfigDir().resolve("pandora-gtb-history.json");
 
@@ -91,6 +94,17 @@ public final class GTBLearningStore {
      * accumulated across rounds so frequent associations rise to the top.
      */
     public void recordRound(String theme, Map<String, Integer> tokenCounts, List<String> guessesSent) {
+        recordRound(theme, tokenCounts, guessesSent, null);
+    }
+
+    /**
+     * Detailed variant: also stores the build's block layout (relative
+     * coordinates -> block id) for the round, capped at the last
+     * MAX_HISTORY_PER_THEME rounds per theme. Lets future scoring inspect
+     * actual shapes, not just token frequencies.
+     */
+    public void recordRound(String theme, Map<String, Integer> tokenCounts, List<String> guessesSent,
+                            Map<String, String> blockLayout) {
         if (theme == null || theme.isBlank()) return;
         String key = normalize(theme);
         ThemeEntry entry = themes.computeIfAbsent(key, k -> new ThemeEntry());
@@ -113,7 +127,33 @@ public final class GTBLearningStore {
                 }
             }
         }
+        if (blockLayout != null && !blockLayout.isEmpty()) {
+            RoundSnapshot snapshot = new RoundSnapshot();
+            snapshot.ts = entry.lastSeen;
+            snapshot.blocks = new HashMap<>(blockLayout);
+            if (guessesSent != null) snapshot.guesses = new ArrayList<>(guessesSent);
+            entry.history.add(snapshot);
+            while (entry.history.size() > MAX_HISTORY_PER_THEME) {
+                entry.history.remove(0);
+            }
+        }
         save();
+    }
+
+    /**
+     * @return recent block layouts the bot has seen for this theme. Useful for
+     * shape-based comparison against the current build.
+     */
+    public List<Map<String, String>> recentLayouts(String theme) {
+        ThemeEntry entry = themes.get(normalize(theme));
+        if (entry == null || entry.history.isEmpty()) return List.of();
+        List<Map<String, String>> out = new ArrayList<>(entry.history.size());
+        for (RoundSnapshot snap : entry.history) {
+            if (snap.blocks != null && !snap.blocks.isEmpty()) {
+                out.add(Collections.unmodifiableMap(snap.blocks));
+            }
+        }
+        return out;
     }
 
     /**
@@ -156,10 +196,22 @@ public final class GTBLearningStore {
         long lastSeen;
         Map<String, Integer> tokens = new HashMap<>();
         List<String> guesses = new ArrayList<>();
+        List<RoundSnapshot> history = new ArrayList<>();
 
         void normalize() {
             if (tokens == null) tokens = new HashMap<>();
             if (guesses == null) guesses = new ArrayList<>();
+            if (history == null) history = new ArrayList<>();
+            for (RoundSnapshot snap : history) {
+                if (snap.blocks == null) snap.blocks = new HashMap<>();
+                if (snap.guesses == null) snap.guesses = new ArrayList<>();
+            }
         }
+    }
+
+    private static final class RoundSnapshot {
+        long ts;
+        Map<String, String> blocks = new HashMap<>();
+        List<String> guesses = new ArrayList<>();
     }
 }

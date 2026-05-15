@@ -791,9 +791,13 @@ public class GTBSolverEngine {
 
         // Record the round in the learning store so the next time this theme
         // (or one with similar blocks) appears, the scanner has prior knowledge.
+        // We record both aggregated token counts AND the full block layout
+        // (relative coords -> id) so future scoring can inspect actual shapes.
         Map<String, Integer> tokensSeen = collectTokenCounts();
-        if (!tokensSeen.isEmpty() || !guessHistory.isEmpty()) {
-            GTBLearningStore.getInstance().recordRound(revealed, tokensSeen, new ArrayList<>(guessHistory));
+        Map<String, String> layout = collectBlockLayout();
+        if (!tokensSeen.isEmpty() || !layout.isEmpty() || !guessHistory.isEmpty()) {
+            GTBLearningStore.getInstance().recordRound(revealed, tokensSeen,
+                    new ArrayList<>(guessHistory), layout);
         }
     }
 
@@ -805,6 +809,25 @@ public class GTBSolverEngine {
             counts.put(token, fp.tokenCount(token));
         }
         return counts;
+    }
+
+    /**
+     * Snapshot of placed blocks keyed by coordinates relative to the plot
+     * centre, so the same theme rebuilt on a different plot lands in the same
+     * coordinate space.
+     */
+    private Map<String, String> collectBlockLayout() {
+        if (plotRegion == null || placed.isEmpty()) return Map.of();
+        Map<String, String> layout = new HashMap<>();
+        Map<Long, String> snapshot = new HashMap<>(placed);
+        for (Map.Entry<Long, String> entry : snapshot.entrySet()) {
+            BlockPos pos = BlockPos.fromLong(entry.getKey());
+            String key = (pos.getX() - plotRegion.centerX) + ","
+                    + (pos.getY() - plotRegion.floorY) + ","
+                    + (pos.getZ() - plotRegion.centerZ);
+            layout.put(key, entry.getValue());
+        }
+        return layout;
     }
 
     private void clearAutoGuessOnRoundMessage(String message) {

@@ -169,6 +169,21 @@ public class GTBSolverEngine {
     private long lastScannerNoticeAt;
     private List<ScoredTheme> lastScannerScores = List.of();
 
+    // Automated farm mode
+    private boolean automatedMode;
+    private AutomatedState automatedState = AutomatedState.IDLE;
+    private long automatedNextActionAt;
+    private long lastWinnersSeenAt;
+    private boolean awaitingBuilderTurn;
+
+    private enum AutomatedState {
+        IDLE,
+        SKIP_HUB,           // we're the builder, sent /hub
+        SKIP_BACK,          // hub loaded, send /back
+        AWAITING_REJOIN,    // round ended, queue /play
+        IN_GAME
+    }
+
     // HUD
     private String hudStatus = "waiting for GTB round";
     private int hudPlacedCount;
@@ -204,11 +219,22 @@ public class GTBSolverEngine {
         tick(guessMode, rotateMatches, activeRoundOnly, 3_000, 5_000);
     }
 
+    public void setAutomatedMode(boolean enabled) {
+        if (this.automatedMode == enabled) return;
+        this.automatedMode = enabled;
+        if (!enabled) {
+            this.automatedState = AutomatedState.IDLE;
+            this.awaitingBuilderTurn = false;
+            this.automatedNextActionAt = 0L;
+        }
+    }
+
     public void tick(String guessMode, boolean rotateMatches, boolean activeRoundOnly,
                      int minDelayMs, int maxDelayMs) {
         this.autoGuessMinDelayMs = Math.max(500, minDelayMs);
         this.autoGuessMaxDelayMs = Math.max(this.autoGuessMinDelayMs, maxDelayMs);
         this.suppressEmptyMatchChat = !GTBSolverModule.MODE_MANUAL.equalsIgnoreCase(guessMode);
+        if (automatedMode) tickAutomated();
         flushPendingSuggestions();
 
         long now = System.currentTimeMillis();
@@ -399,6 +425,9 @@ public class GTBSolverEngine {
         lastScannerScores = List.of();
         hudStatus = "waiting for GTB round";
         hudPlacedCount = 0;
+        automatedState = AutomatedState.IDLE;
+        automatedNextActionAt = 0L;
+        awaitingBuilderTurn = false;
     }
 
     public String getShortestTranslation(String englishWord) {
@@ -796,6 +825,22 @@ public class GTBSolverEngine {
             lastThemeSignalAt = now;
             lastThemeLabel = extractValueAfterColon(plain, "theme");
         }
+
+        // Automated farm hooks: detect when we are the builder this round
+        // (Hypixel shows "You are the builder!" or "It's your turn to build")
+        // and when a game ends (the "Winners" recap appears).
+        if (automatedMode) {
+            if ((lower.contains("your turn to build")
+                    || lower.contains("you are the builder")
+                    || lower.contains("you are now building"))
+                    && !awaitingBuilderTurn) {
+                triggerSkipTurnIfBuilder();
+            }
+            if (lower.startsWith("winners") || lower.contains("game over!")
+                    || lower.contains("1st place") || lower.contains("first place")) {
+                triggerRejoinIfAutomated();
+            }
+        }
     }
 
     private void handleThemeReveal(String message) {
@@ -849,6 +894,69 @@ public class GTBSolverEngine {
             layout.put(key, entry.getValue());
         }
         return layout;
+    }
+
+    // ===================== Automated farm =====================
+
+    /**
+     * Drives the state machine: when we're the builder, skip our turn with
+     * /hub then /back; when a game ends, requeue with /play. Runs every
+     * tick - operations are gated on automatedNextActionAt so we don't spam.
+     */
+    private void tickAutomated() {
+        long now = System.currentTimeMillis();
+        if (now < automatedNextActionAt) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null || client.getNetworkHandler() == null) return;
+
+        switch (automatedState) {
+            case SKIP_HUB -> {
+                client.getNetworkHandler().sendChatMessage("/hub");
+                automatedState = AutomatedState.SKIP_BACK;
+                automatedNextActionAt = now + 4_000L;
+            }
+            case SKIP_BACK -> {
+                client.getNetworkHandler().sendChatMessage("/back");
+                automatedState = AutomatedState.IN_GAME;
+                automatedNextActionAt = now + 2_000L;
+                awaitingBuilderTurn = false;
+            }
+            case AWAITING_REJOIN -> {
+                client.getNetworkHandler().sendChatMessage("/play build_battle_guess_the_build");
+                automatedState = AutomatedState.IN_GAME;
+                automatedNextActionAt = now + 8_000L;
+            }
+            default -> {
+                // Nothing to do; chat hooks will move us out of IDLE/IN_GAME.
+            }
+        }
+    }
+
+    /**
+     * Called from chat parsing when the scoreboard / chat indicates we are
+     * the builder for the current round. Schedules the skip-turn flow.
+     */
+    private void triggerSkipTurnIfBuilder() {
+        if (!automatedMode) return;
+        if (automatedState != AutomatedState.IN_GAME && automatedState != AutomatedState.IDLE) return;
+        // 1.2s grace so the server fully transitions to the builder UI before /hub.
+        automatedState = AutomatedState.SKIP_HUB;
+        automatedNextActionAt = System.currentTimeMillis() + 1_200L;
+        awaitingBuilderTurn = true;
+    }
+
+    /**
+     * Called from chat parsing when "Winners" or game-end signals appear.
+     * Schedules the /play rejoin.
+     */
+    private void triggerRejoinIfAutomated() {
+        if (!automatedMode) return;
+        long now = System.currentTimeMillis();
+        // Debounce - the server posts several winner lines back to back.
+        if (now - lastWinnersSeenAt < 5_000L) return;
+        lastWinnersSeenAt = now;
+        automatedState = AutomatedState.AWAITING_REJOIN;
+        automatedNextActionAt = now + 5_000L;
     }
 
     private void clearAutoGuessOnRoundMessage(String message) {

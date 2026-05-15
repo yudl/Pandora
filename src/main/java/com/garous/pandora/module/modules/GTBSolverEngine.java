@@ -130,8 +130,14 @@ public class GTBSolverEngine {
     // Auto-guess state
     private final List<String> autoGuessQueue = new ArrayList<>();
     private final List<String> guessHistory = new ArrayList<>();
+    private final java.util.Random random = new java.util.Random();
     private int autoGuessIndex;
     private long lastAutoGuessAt;
+    private long nextAutoGuessDelayMs = AUTO_GUESS_INTERVAL_MS;
+    private int autoGuessMinDelayMs = 3_000;
+    private int autoGuessMaxDelayMs = 5_000;
+    private String lastSentGuess = "";
+    private boolean roundGuessLocked;
 
     // Round / game signals
     private String activeRoundKey = "";
@@ -190,6 +196,13 @@ public class GTBSolverEngine {
     }
 
     public void tick(String guessMode, boolean rotateMatches, boolean activeRoundOnly) {
+        tick(guessMode, rotateMatches, activeRoundOnly, 3_000, 5_000);
+    }
+
+    public void tick(String guessMode, boolean rotateMatches, boolean activeRoundOnly,
+                     int minDelayMs, int maxDelayMs) {
+        this.autoGuessMinDelayMs = Math.max(500, minDelayMs);
+        this.autoGuessMaxDelayMs = Math.max(this.autoGuessMinDelayMs, maxDelayMs);
         flushPendingSuggestions();
 
         long now = System.currentTimeMillis();
@@ -606,13 +619,18 @@ public class GTBSolverEngine {
 
     private void sendQueuedAutoGuess(boolean rotateMatches) {
         if (autoGuessQueue.isEmpty()) return;
+        if (roundGuessLocked) return;
         long now = System.currentTimeMillis();
-        if (now - lastAutoGuessAt < AUTO_GUESS_INTERVAL_MS) return;
+        if (now - lastAutoGuessAt < nextAutoGuessDelayMs) return;
         int queueIndex = rotateMatches && autoGuessQueue.size() > 1 ? autoGuessIndex % autoGuessQueue.size() : 0;
         String englishGuess = autoGuessQueue.get(queueIndex);
         String translatedGuess = getShortestTranslation(englishGuess);
         if (sendChatMessage(translatedGuess)) {
             lastAutoGuessAt = now;
+            lastSentGuess = translatedGuess;
+            // Roll a fresh random delay for the next send so the cadence varies.
+            int spread = autoGuessMaxDelayMs - autoGuessMinDelayMs;
+            nextAutoGuessDelayMs = autoGuessMinDelayMs + (spread > 0 ? random.nextInt(spread + 1) : 0);
             hudStatus = "sent " + translatedGuess;
             if (rotateMatches && autoGuessQueue.size() > 1) {
                 autoGuessIndex = (autoGuessIndex + 1) % autoGuessQueue.size();
@@ -676,16 +694,24 @@ public class GTBSolverEngine {
     private void clearAutoGuessOnRoundMessage(String message) {
         String lower = stripFormatting(message).toLowerCase(Locale.ROOT);
         if (lower.contains("_")) return;
-        if (lower.contains("you guessed") || lower.contains("guessed the theme")
+        boolean ownCorrect = lower.contains("you guessed") || lower.contains("you got it")
+                || ownPlayerGuessedCorrectly(lower);
+        boolean roundEnded = ownCorrect || lower.contains("guessed the theme")
                 || lower.contains("the theme was") || lower.contains("round over")
-                || lower.contains("game over") || lower.contains("next round")) {
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastScannerGuess = "";
-            lastScannerTheme = "";
-            lastScannerScores = List.of();
-            hudPlacedCount = 0;
-            lastHint = "";
+                || lower.contains("game over") || lower.contains("next round");
+        if (!roundEnded) return;
+
+        autoGuessQueue.clear();
+        autoGuessIndex = 0;
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
+        hudPlacedCount = 0;
+        lastHint = "";
+        if (ownCorrect) {
+            // Stay quiet for the rest of the round once our guess is accepted.
+            roundGuessLocked = true;
+            hudStatus = "guessed correctly";
         }
     }
 
@@ -1070,6 +1096,8 @@ public class GTBSolverEngine {
         autoGuessQueue.clear();
         autoGuessIndex = 0;
         lastAutoGuessAt = 0L;
+        lastSentGuess = "";
+        roundGuessLocked = false;
         // Re-anchor the plot at next opportunity for the new round.
         plotRegion = null;
         baseline.clear();
@@ -1101,6 +1129,16 @@ public class GTBSolverEngine {
         int start = lm.indexOf(lp);
         if (start < 0) return "";
         return clean(message.substring(start + lp.length()));
+    }
+
+    private boolean ownPlayerGuessedCorrectly(String lower) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return false;
+        String name = client.player.getName().getString().toLowerCase(Locale.ROOT);
+        if (name.isEmpty()) return false;
+        // "<name> guessed it" / "<name> guessed the theme" addressed to our player.
+        return (lower.contains("guessed") && lower.contains(name))
+                && (lower.contains("guessed it") || lower.contains("guessed the"));
     }
 
     private static boolean mentionsGtb(String text) {

@@ -24,11 +24,26 @@ public class GTBSolverModule extends Module {
     public static final String LEGACY_MODE_AUTO_HINTS = "auto hints";
     public static final String LEGACY_MODE_AUTO_HINTS_PREHINT = "auto hints + prehint";
 
+    // Auto-guess delay presets. The bot picks a random delay in the given
+    // [min, max] range each send so the cadence looks human.
+    public static final String DELAY_FAST = "1-2s";
+    public static final String DELAY_QUICK = "2-3s";
+    public static final String DELAY_NATURAL = "3-5s";
+    public static final String DELAY_CASUAL = "3-6s";
+    public static final String DELAY_RELAXED = "4-7s";
+    public static final String DELAY_SLOW = "5-10s";
+
     private final ModeSetting guessMode = new ModeSetting(
             "guess_mode",
             "mode",
             List.of(MODE_MANUAL, MODE_AUTO_HINTS, MODE_AUTO_HINTS_SCANNER),
             MODE_MANUAL
+    );
+    private final ModeSetting autoGuessDelay = new ModeSetting(
+            "auto_guess_delay",
+            "delay",
+            List.of(DELAY_FAST, DELAY_QUICK, DELAY_NATURAL, DELAY_CASUAL, DELAY_RELAXED, DELAY_SLOW),
+            DELAY_NATURAL
     );
     private final BooleanSetting rotateMatches = new BooleanSetting("rotate_matches", "rotate", true);
     private final BooleanSetting activeRoundOnly = new BooleanSetting("active_round_only", "round-only", true);
@@ -36,6 +51,7 @@ public class GTBSolverModule extends Module {
 
     private final List<ModuleSetting<?>> settings = List.of(
             guessMode,
+            autoGuessDelay,
             rotateMatches,
             activeRoundOnly,
             guessHistoryHud
@@ -55,9 +71,23 @@ public class GTBSolverModule extends Module {
         PandoraConfig config = PandoraConfig.getInstance();
         String savedMode = config.getModuleTextOption(getName(), guessMode.getId(), MODE_MANUAL);
         guessMode.setValue(migrateLegacyMode(savedMode));
+        autoGuessDelay.setValue(config.getModuleTextOption(getName(), autoGuessDelay.getId(), DELAY_NATURAL));
         rotateMatches.setValue(config.getModuleOption(getName(), rotateMatches.getId(), true));
         activeRoundOnly.setValue(config.getModuleOption(getName(), activeRoundOnly.getId(), true));
         guessHistoryHud.setValue(config.getModuleOption(getName(), guessHistoryHud.getId(), true));
+    }
+
+    public int[] getAutoGuessDelayMillis() {
+        String value = autoGuessDelay.getValue();
+        // Format "<min>-<max>s"; default to natural if parse fails.
+        try {
+            String[] parts = value.replace("s", "").split("-");
+            int min = Integer.parseInt(parts[0].trim());
+            int max = Integer.parseInt(parts[1].trim());
+            return new int[]{min * 1000, max * 1000};
+        } catch (Exception ignored) {
+            return new int[]{3_000, 5_000};
+        }
     }
 
     private static String migrateLegacyMode(String value) {
@@ -85,10 +115,13 @@ public class GTBSolverModule extends Module {
 
     @Override
     public void onTick() {
+        int[] delay = getAutoGuessDelayMillis();
         GTBSolverEngine.getInstance().tick(
                 guessMode.getValue(),
                 rotateMatches.getValue(),
-                activeRoundOnly.getValue()
+                activeRoundOnly.getValue(),
+                delay[0],
+                delay[1]
         );
     }
 

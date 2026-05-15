@@ -206,6 +206,14 @@ public final class GTBLearningStore {
         return themes.size();
     }
 
+    public int totalRoundsObserved() {
+        int total = 0;
+        for (ThemeEntry entry : themes.values()) {
+            total += entry.rounds;
+        }
+        return total;
+    }
+
     private static String normalize(String value) {
         return value == null ? "" : value.toLowerCase(Locale.ROOT).trim();
     }

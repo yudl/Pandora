@@ -339,6 +339,8 @@ public class GTBSolverEngine {
             String label = (i == 0 ? "» " : "  ") + truncate(st.theme(), 18);
             lines.add(new HudLine(label, i == 0 ? scannerColor : mutedColor));
         }
+        GTBLearningStore store = GTBLearningStore.getInstance();
+        lines.add(new HudLine("db: " + store.size() + " themes / " + store.totalRoundsObserved() + " rounds", 0xFF7799BB));
         if (!guessHistory.isEmpty()) {
             lines.add(new HudLine("--- recent ---", 0xFF55555F));
             int historySize = Math.min(guessHistory.size(), 4);

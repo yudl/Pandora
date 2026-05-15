@@ -197,9 +197,10 @@ public class GTBSolverEngine {
 
     private enum AutomatedState {
         IDLE,
-        SKIP_HUB,           // we're the builder, sent /hub
-        SKIP_BACK,          // hub loaded, send /back
-        AWAITING_REJOIN,    // round ended, queue /play
+        AWAITING_THEME_GUI,  // builder turn detected, waiting for the chest GUI to open
+        SKIP_HUB,            // we're the builder, theme picked, sent /hub
+        SKIP_BACK,           // hub loaded, send /back
+        AWAITING_REJOIN,     // round ended, queue /play
         IN_GAME
     }
 
@@ -933,15 +934,26 @@ public class GTBSolverEngine {
      */
     private void tickAutomated() {
         long now = System.currentTimeMillis();
-        if (now < automatedNextActionAt) return;
         MinecraftClient client = MinecraftClient.getInstance();
         if (client == null || client.player == null || client.getNetworkHandler() == null) return;
+
+        // The theme-select chest GUI is the actual blocker on our turn, not a
+        // chat line - poll for it and click the leftmost theme slot the
+        // moment it opens.
+        if (automatedState == AutomatedState.IDLE || automatedState == AutomatedState.IN_GAME
+                || automatedState == AutomatedState.AWAITING_THEME_GUI) {
+            if (tryClickThemeGuiIfOpen(client, now)) {
+                return;
+            }
+        }
+
+        if (now < automatedNextActionAt) return;
 
         switch (automatedState) {
             case SKIP_HUB -> {
                 client.getNetworkHandler().sendChatMessage("/hub");
                 automatedState = AutomatedState.SKIP_BACK;
-                automatedNextActionAt = now + 4_000L;
+                automatedNextActionAt = now + 2_500L;
             }
             case SKIP_BACK -> {
                 client.getNetworkHandler().sendChatMessage("/back");
@@ -955,9 +967,55 @@ public class GTBSolverEngine {
                 automatedNextActionAt = now + 8_000L;
             }
             default -> {
-                // Nothing to do; chat hooks will move us out of IDLE/IN_GAME.
+                // IDLE / IN_GAME / AWAITING_THEME_GUI - nothing to send yet.
             }
         }
+    }
+
+    private long lastThemeGuiClickAt;
+
+    /**
+     * If the player's current screen is the GTB theme-select chest, click the
+     * leftmost non-decorative slot, then schedule /hub. Returns true if we
+     * acted, false otherwise (caller skips the rest of the state machine).
+     */
+    private boolean tryClickThemeGuiIfOpen(MinecraftClient client, long now) {
+        if (client.currentScreen == null) return false;
+        if (now - lastThemeGuiClickAt < 1_500L) return false;
+        // Avoid touching anything that isn't a server-driven chest.
+        if (!(client.currentScreen instanceof net.minecraft.client.gui.screen.ingame.HandledScreen<?> hs)) return false;
+        String title = client.currentScreen.getTitle() == null ? "" : client.currentScreen.getTitle().getString().toLowerCase(Locale.ROOT);
+        if (!title.contains("select a theme") && !title.contains("theme to build")) return false;
+
+        net.minecraft.screen.ScreenHandler handler = hs.getScreenHandler();
+        if (handler == null || client.interactionManager == null) return false;
+        // Inventory portion of the slot list is the bottom 36; only iterate the
+        // upper container slots and pick the first one whose stack isn't a
+        // decorative glass pane.
+        int containerSize = Math.max(0, handler.slots.size() - 36);
+        int targetSlot = -1;
+        for (int i = 0; i < containerSize; i++) {
+            net.minecraft.item.ItemStack stack;
+            try {
+                stack = handler.slots.get(i).getStack();
+            } catch (Exception ignored) {
+                continue;
+            }
+            if (stack == null || stack.isEmpty()) continue;
+            String id = net.minecraft.registry.Registries.ITEM.getId(stack.getItem()).getPath();
+            if (id.contains("glass_pane") || id.contains("stained_glass")) continue;
+            targetSlot = i;
+            break;
+        }
+        if (targetSlot < 0) return false;
+
+        client.interactionManager.clickSlot(handler.syncId, targetSlot, 0,
+                net.minecraft.screen.slot.SlotActionType.PICKUP, client.player);
+        lastThemeGuiClickAt = now;
+        automatedState = AutomatedState.SKIP_HUB;
+        automatedNextActionAt = now + 600L;
+        awaitingBuilderTurn = true;
+        return true;
     }
 
     /**
@@ -967,9 +1025,11 @@ public class GTBSolverEngine {
     private void triggerSkipTurnIfBuilder() {
         if (!automatedMode) return;
         if (automatedState != AutomatedState.IN_GAME && automatedState != AutomatedState.IDLE) return;
-        // 1.2s grace so the server fully transitions to the builder UI before /hub.
-        automatedState = AutomatedState.SKIP_HUB;
-        automatedNextActionAt = System.currentTimeMillis() + 1_200L;
+        // We don't /hub yet; the next tick will detect the theme-select chest
+        // GUI and click it before sending /hub. This makes the skip nearly
+        // instant instead of waiting on a fixed delay.
+        automatedState = AutomatedState.AWAITING_THEME_GUI;
+        automatedNextActionAt = 0L;
         awaitingBuilderTurn = true;
     }
 
@@ -1245,8 +1305,36 @@ public class GTBSolverEngine {
             score *= 0.05;
         }
 
+        // 7) Penalise single-word themes whose entire name is a generic color
+        // or material. Without this, placing a stack of green blocks would
+        // surface 'Green' / 'Green Wool' as a top guess, beating themes like
+        // 'Christmas Tree' / 'Apple' / 'Lime' that actually use green blocks.
+        // Variety bonus: themes whose name has multiple tokens AND multiple of
+        // those tokens appear in the build (e.g. 'Diamond Ring' with diamond
+        // AND a ring-shaped profile match) are upweighted.
+        if (themeTokens.size() == 1) {
+            String only = themeTokens.iterator().next();
+            if (GENERIC_TOKEN_NAMES.contains(only)) {
+                score *= 0.25;
+            }
+        } else if (themeTokens.size() >= 2) {
+            int matched = 0;
+            for (String token : themeTokens) {
+                if (fp.tokenCount(token) > 0) matched++;
+            }
+            if (matched >= 2) score *= 1.5;
+        }
+
         return score;
     }
+
+    /** Single-word generic colour / material names that should rarely win the scanner. */
+    private static final Set<String> GENERIC_TOKEN_NAMES = Set.of(
+            "white", "orange", "magenta", "yellow", "lime", "pink", "gray", "grey", "silver",
+            "cyan", "purple", "blue", "brown", "green", "red", "black",
+            "gold", "iron", "diamond", "emerald", "stone", "wood", "wool", "glass",
+            "dirt", "sand", "water", "ice", "snow", "obsidian", "redstone", "lapis"
+    );
 
     private double scoreProfile(GTBThemeProfiles.Profile profile, BuildFingerprint fp) {
         double score = 0.0;

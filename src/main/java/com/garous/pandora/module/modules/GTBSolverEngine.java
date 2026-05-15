@@ -476,6 +476,11 @@ public class GTBSolverEngine {
     // ===================== Hint extraction =====================
 
     private Optional<String> extractHint(Text message, boolean allowLooseHint) {
+        // Reject obvious chat lines that aren't hints (player joins/leaves with
+        // underscores in their names used to set lastHint = "<playername>").
+        String rawPlain = stripFormatting(message.getString()).toLowerCase(Locale.ROOT);
+        if (isJoinOrLeaveLine(rawPlain)) return Optional.empty();
+
         Optional<String> styledHint = extractYellowText(message);
         if (styledHint.isPresent()) return styledHint;
 
@@ -485,15 +490,22 @@ public class GTBSolverEngine {
         String plainWithoutFormatting = stripFormatting(plain);
         int colonIndex = plainWithoutFormatting.lastIndexOf(':');
         if (colonIndex >= 0 && plainWithoutFormatting.substring(colonIndex + 1).contains("_")) {
-            return normalizeHint(plainWithoutFormatting.substring(colonIndex + 1));
+            String candidate = plainWithoutFormatting.substring(colonIndex + 1);
+            if (looksLikeHint(candidate)) return normalizeHint(candidate);
         }
         Matcher themeMatcher = THEME_HINT.matcher(plainWithoutFormatting);
         if (themeMatcher.matches() && themeMatcher.group(1).contains("_")) {
-            return normalizeHint(themeMatcher.group(1));
+            String candidate = themeMatcher.group(1);
+            if (looksLikeHint(candidate)) return normalizeHint(candidate);
         }
         Matcher legacyMatcher = LEGACY_YELLOW_HINT.matcher(plain);
-        if (legacyMatcher.find()) return normalizeHint(legacyMatcher.group());
-        return allowLooseHint ? extractLooseHintRun(plainWithoutFormatting) : Optional.empty();
+        if (legacyMatcher.find()) {
+            String candidate = legacyMatcher.group();
+            if (looksLikeHint(candidate)) return normalizeHint(candidate);
+        }
+        if (!allowLooseHint) return Optional.empty();
+        Optional<String> loose = extractLooseHintRun(plainWithoutFormatting);
+        return loose.filter(this::looksLikeHint);
     }
 
     private Optional<String> extractYellowText(Text message) {
@@ -504,7 +516,53 @@ public class GTBSolverEngine {
             }
             return Optional.empty();
         }, Style.EMPTY);
-        return normalizeHint(hint.toString());
+        String collected = hint.toString();
+        if (!looksLikeHint(collected)) return Optional.empty();
+        return normalizeHint(collected);
+    }
+
+    /**
+     * Heuristic: a real GTB hint is mostly underscores with at most a few
+     * revealed letters per token. Player names like "Steve_123" or chat lines
+     * with stray underscores fail this check.
+     */
+    private boolean looksLikeHint(String raw) {
+        if (raw == null) return false;
+        String s = stripFormatting(raw).trim();
+        if (s.isEmpty()) return false;
+        long underscores = s.chars().filter(c -> c == '_').count();
+        if (underscores == 0) return false;
+        long letters = s.chars().filter(Character::isLetter).count();
+        // Players names usually have >=4 letters and at most one underscore.
+        if (underscores == 1 && letters >= 4) return false;
+        // A real hint has roughly as many underscores as letters; reject lines
+        // dominated by letters.
+        if (letters > underscores * 2 + 2) return false;
+        // Reject any token with more than 3 consecutive revealed letters - real
+        // hints reveal letters one at a time and don't leave long letter runs.
+        int run = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isLetter(c)) {
+                run++;
+                if (run > 3) return false;
+            } else {
+                run = 0;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isJoinOrLeaveLine(String lower) {
+        return lower.contains("joined the lobby")
+                || lower.contains("joined the game")
+                || lower.contains("left the lobby")
+                || lower.contains("left the game")
+                || lower.contains(" disconnected")
+                || lower.contains(" reconnected")
+                || lower.contains("kicked from")
+                || lower.contains("party invite")
+                || lower.contains("friend request");
     }
 
     private Optional<String> normalizeHint(String rawHint) {
@@ -602,7 +660,10 @@ public class GTBSolverEngine {
         autoGuessQueue.clear();
         autoGuessQueue.addAll(englishCandidates);
         autoGuessIndex = 0;
-        lastAutoGuessAt = 0L;
+        // NOTE: don't reset lastAutoGuessAt here. The scanner reranks every
+        // ~750ms as new blocks arrive; resetting the cooldown made every queue
+        // shuffle fire an immediate guess (the spam bug). The cooldown is now
+        // only reset at the start of a round (beginRound()).
         if (!englishCandidates.isEmpty()) hudStatus = "queued " + englishCandidates.size();
     }
 
@@ -635,7 +696,11 @@ public class GTBSolverEngine {
         if (roundGuessLocked) return;
         long now = System.currentTimeMillis();
         if (now - lastAutoGuessAt < nextAutoGuessDelayMs) return;
-        int queueIndex = rotateMatches && autoGuessQueue.size() > 1 ? autoGuessIndex % autoGuessQueue.size() : 0;
+        // Pre-hint: queue[0] is always the scanner's best (highest score). Don't
+        // rotate, otherwise the HUD shows "scanner: shield" but the bot types
+        // a different theme from later in the queue.
+        boolean rotateNow = rotateMatches && !lastHint.isBlank() && autoGuessQueue.size() > 1;
+        int queueIndex = rotateNow ? autoGuessIndex % autoGuessQueue.size() : 0;
         String englishGuess = autoGuessQueue.get(queueIndex);
         String translatedGuess = getShortestTranslation(englishGuess);
         if (sendChatMessage(translatedGuess)) {
@@ -645,7 +710,7 @@ public class GTBSolverEngine {
             int spread = autoGuessMaxDelayMs - autoGuessMinDelayMs;
             nextAutoGuessDelayMs = autoGuessMinDelayMs + (spread > 0 ? random.nextInt(spread + 1) : 0);
             hudStatus = "sent " + translatedGuess;
-            if (rotateMatches && autoGuessQueue.size() > 1) {
+            if (rotateNow) {
                 autoGuessIndex = (autoGuessIndex + 1) % autoGuessQueue.size();
             }
         }
@@ -864,7 +929,12 @@ public class GTBSolverEngine {
 
         ScoredTheme best = scored.get(0);
         double secondScore = scored.size() > 1 ? scored.get(1).score() : 0.0;
-        if (best.score() - secondScore < SCAN_LEAD_THRESHOLD) {
+        // Bypass the lead threshold for tiny single-block-dominant builds — if
+        // someone places a cake / crafting table / furnace, the dominant block
+        // alone identifies the theme and the bot should commit to it.
+        boolean singleBlockDominant = fp.totalBlocks() <= 6 && fp.dominantBlockId() != null
+                && !GTBBlockSignatures.singleBlockThemes(fp.dominantBlockId()).isEmpty();
+        if (!singleBlockDominant && best.score() - secondScore < SCAN_LEAD_THRESHOLD) {
             hudStatus = "scanner: " + scored.size() + " candidates";
             return;
         }
@@ -1131,11 +1201,14 @@ public class GTBSolverEngine {
                 || (hasBuilderSignal && hasTimeSignal) || recentHint || recentRound);
         boolean revealedThemeVisible = !visibleTheme.isBlank() && !visibleTheme.contains("?") && !visibleTheme.contains("_");
 
+        // Round key excludes the theme line on purpose - the theme line changes
+        // every time another letter is revealed, and including it caused
+        // beginRound() to wipe scanner state mid-round (which then re-emitted
+        // the same hint suggestions repeatedly).
         String roundKey = activeRound
                 ? String.join("|",
                 roundLine != null ? roundLine : lastRoundLabel,
-                builderLine != null ? builderLine : lastBuilderLabel,
-                themeLine != null ? themeLine : lastThemeLabel)
+                builderLine != null ? builderLine : lastBuilderLabel)
                 : "";
 
         return new GameContext(inGuessTheBuild, activeRound, roundKey, revealedThemeVisible);

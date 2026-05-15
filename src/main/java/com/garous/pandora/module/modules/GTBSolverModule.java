@@ -69,6 +69,7 @@ public class GTBSolverModule extends Module {
         activeRoundOnly.setValue(config.getModuleOption(getName(), activeRoundOnly.getId(), true));
         guessHistoryHud.setValue(config.getModuleOption(getName(), guessHistoryHud.getId(), true));
         automated.setValue(config.getModuleOption(getName(), automated.getId(), false));
+        GTBSolverEngine.loadHudPositionFromConfig();
     }
 
     private void loadDelayFromConfig(PandoraConfig config) {

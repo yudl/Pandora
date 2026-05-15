@@ -2,6 +2,7 @@ package com.garous.pandora;
 
 import com.garous.pandora.gui.ClickGUIScreen;
 import com.garous.pandora.gui.GTBGuessHistoryHud;
+import com.garous.pandora.gui.HudEditScreen;
 import com.garous.pandora.config.PandoraConfig;
 import com.garous.pandora.module.Module;
 import com.garous.pandora.module.ModuleManager;
@@ -23,6 +24,7 @@ import org.lwjgl.glfw.GLFW;
 public class PandoraClient implements ClientModInitializer {
 
     private static KeyBinding clickGuiKey;
+    private static KeyBinding hudEditKey;
     private static final KeyBinding.Category PANDORA_CATEGORY =
             KeyBinding.Category.create(Identifier.of(Pandora.MOD_ID, "controls"));
 
@@ -33,6 +35,12 @@ public class PandoraClient implements ClientModInitializer {
                 "key.pandora.clickgui",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_RIGHT_SHIFT,
+                PANDORA_CATEGORY
+        ));
+        hudEditKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.pandora.hudedit",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_RIGHT_CONTROL,
                 PANDORA_CATEGORY
         ));
 
@@ -47,6 +55,13 @@ public class PandoraClient implements ClientModInitializer {
                     clickGUI.requestClose();
                 } else if (client.currentScreen == null) {
                     client.setScreen(new ClickGUIScreen());
+                }
+            }
+            while (hudEditKey.wasPressed()) {
+                if (client.currentScreen instanceof HudEditScreen) {
+                    client.setScreen(null);
+                } else if (client.currentScreen == null) {
+                    client.setScreen(new HudEditScreen());
                 }
             }
 

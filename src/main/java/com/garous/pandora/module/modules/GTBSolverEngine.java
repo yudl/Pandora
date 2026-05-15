@@ -72,9 +72,13 @@ public class GTBSolverEngine {
     private static final long GAME_SIGNAL_GRACE_MS = 30_000L;
     private static final long ROUND_SIGNAL_GRACE_MS = 25_000L;
 
-    private static final int PLOT_HALF_SIZE = 13;       // 27x27 plot
-    private static final int PLOT_SCAN_BELOW = 2;       // scan 2 below floor (signs/buttons)
-    private static final int PLOT_SCAN_ABOVE = 30;      // 30 above floor
+    // Widened from 13/2/30 to cover the largest plot variants and any
+    // overflow blocks placed slightly outside the visible build pad. Plus
+    // a generous vertical envelope so very tall builds (rocket, tower,
+    // skyscraper) aren't truncated.
+    private static final int PLOT_HALF_SIZE = 18;       // 37x37 plot
+    private static final int PLOT_SCAN_BELOW = 4;       // scan 4 below floor
+    private static final int PLOT_SCAN_ABOVE = 50;      // 50 above floor
     private static final int FLOOR_PROBE_RADIUS = 2;    // 5x5 floor lookup
     private static final int FLOOR_PROBE_DEPTH = 6;     // search up to 6 below player
     private static final int MAX_PLACED_BLOCKS = 1500;
@@ -83,8 +87,23 @@ public class GTBSolverEngine {
     private static final double SCAN_LEAD_THRESHOLD = 1.8;
     private static final double SINGLE_BLOCK_LEAD_BONUS = 12.0;
 
-    private static final int HUD_X = 6;
-    private static final int HUD_Y = 18;
+    // HUD position is movable; defaults match the historical fixed location.
+    // Drag with the dedicated HUD-edit screen (opened from PandoraClient).
+    private static volatile int hudOriginX = 6;
+    private static volatile int hudOriginY = 18;
+    public static int getHudOriginX() { return hudOriginX; }
+    public static int getHudOriginY() { return hudOriginY; }
+    public static void setHudOrigin(int x, int y) {
+        hudOriginX = Math.max(0, x);
+        hudOriginY = Math.max(0, y);
+        PandoraConfig.getInstance().setModuleTextOption("gtb solver", "hud_x", Integer.toString(hudOriginX));
+        PandoraConfig.getInstance().setModuleTextOption("gtb solver", "hud_y", Integer.toString(hudOriginY));
+    }
+    public static void loadHudPositionFromConfig() {
+        PandoraConfig c = PandoraConfig.getInstance();
+        try { hudOriginX = Integer.parseInt(c.getModuleTextOption("gtb solver", "hud_x", "6")); } catch (Exception ignored) {}
+        try { hudOriginY = Integer.parseInt(c.getModuleTextOption("gtb solver", "hud_y", "18")); } catch (Exception ignored) {}
+    }
 
     private static final Map<String, Double> COMMON_THEME_PRIORS = Map.ofEntries(
             Map.entry("tree", 8.0),
@@ -377,16 +396,25 @@ public class GTBSolverEngine {
         }
 
         int height = 16 + lines.size() * 10;
-        context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + height, bodyColor);
-        context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + 14, headerColor);
-        context.fill(HUD_X, HUD_Y, HUD_X + 3, HUD_Y + 14, accentColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb scanner", HUD_X + 6, HUD_Y + 3, textColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudPlacedCount + " blocks", HUD_X + width - 56, HUD_Y + 3, mutedColor);
+        int x0 = hudOriginX, y0 = hudOriginY;
+        context.fill(x0, y0, x0 + width, y0 + height, bodyColor);
+        context.fill(x0, y0, x0 + width, y0 + 14, headerColor);
+        context.fill(x0, y0, x0 + 3, y0 + 14, accentColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb scanner", x0 + 6, y0 + 3, textColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudPlacedCount + " blocks", x0 + width - 56, y0 + 3, mutedColor);
 
         for (int i = 0; i < lines.size(); i++) {
             HudLine line = lines.get(i);
-            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, line.text, HUD_X + 6, HUD_Y + 18 + i * 10, line.color);
+            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, line.text, x0 + 6, y0 + 18 + i * 10, line.color);
         }
+    }
+
+    /** Bounds used by the HUD-edit screen to test mouse hover / drag. */
+    public int[] getHudBounds() {
+        int width = 144;
+        // Approximate height; close enough for drag-bounds.
+        int height = 16 + Math.max(1, 6) * 10;
+        return new int[]{hudOriginX, hudOriginY, width, height};
     }
 
     private static String truncate(String s, int max) {

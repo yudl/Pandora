@@ -615,7 +615,13 @@ public class GTBSolverEngine {
         if (matches.equals(lastResults) && !matches.isEmpty()) return;
 
         lastResults = matches;
-        updateAutoGuessQueue(matches);
+        // Auto-guess queue only takes the top 3 by block fit. The full match
+        // list (lastResults) is kept for the /command chat dump.
+        // Without this cap the bot rotates through every hint-compatible
+        // word ('p_zza' has dozens of matches), guessing weak fits one at
+        // a time. Top-3 lets us rotate among only the best block-fits.
+        List<String> queue = matches.size() > 3 ? new ArrayList<>(matches.subList(0, 3)) : matches;
+        updateAutoGuessQueue(queue);
         synchronized (this) {
             pendingResults = matches;
         }
@@ -659,22 +665,24 @@ public class GTBSolverEngine {
     private double hintCandidateScore(String theme, BuildFingerprint fp) {
         String key = theme.toLowerCase(Locale.ROOT);
         double score = 0.0;
-        // 1) Live block-vs-theme fit. This is the heart of the hint-aware
-        // ranking - 'diamond ring' wins for ['gold','diamond'] regardless of
-        // whether the scanner surfaced it pre-hint.
+        // 1) Live block-vs-theme fit, weighted heavily. Without this multiplier
+        // generic 'popular' themes (computer, robot, ...) outranked themes
+        // whose blocks were literally on screen, because frequency / priors
+        // contributed comparable points. We want block evidence to dominate.
         if (fp != null) {
-            score += scoreTheme(theme, fp);
+            score += scoreTheme(theme, fp) * 4.0;
         }
-        // 2) If the scanner had already locked onto this theme pre-hint,
-        // fold its score in too (cached signal, complements the live score).
+        // 2) Cached scanner pre-hint score, light contribution.
         for (ScoredTheme scoredTheme : lastScannerScores) {
             if (scoredTheme.theme().equalsIgnoreCase(key)) {
                 score += scoredTheme.score() * 0.5;
                 break;
             }
         }
-        score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0);
-        score += PandoraConfig.getInstance().getThemeFrequency(theme) * 1.15;
+        // 3) Tiebreakers only - kept small so a single block match still wins
+        // over a popular-but-unrelated theme.
+        score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0) * 0.2;
+        score += PandoraConfig.getInstance().getThemeFrequency(theme) * 0.3;
         if (theme.equalsIgnoreCase(lastScannerTheme)) score += 8.0;
         return score;
     }

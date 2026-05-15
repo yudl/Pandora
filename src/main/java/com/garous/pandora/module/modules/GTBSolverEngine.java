@@ -626,18 +626,39 @@ public class GTBSolverEngine {
     }
 
     private List<String> rankHintMatches(List<String> matches) {
+        // When a hint arrives, score EVERY hint-compatible word against the
+        // currently placed blocks. This is what makes hints like "p__" prefer
+        // 'pig' over 'pie' if pig fits the blocks better - rather than
+        // ranking purely by what the scanner happened to surface pre-hint.
+        BuildFingerprint fp = (plotRegion != null && !placed.isEmpty())
+                ? BuildFingerprint.fromPlaced(placed, plotRegion)
+                : null;
+        if (fp != null) {
+            String builderHeldToken = readBuilderHeldBlockToken();
+            if (builderHeldToken != null) fp.addExtraToken(builderHeldToken);
+        }
+        final BuildFingerprint capturedFp = fp;
         return matches.stream()
-                .sorted(Comparator.comparingDouble(this::hintCandidateScore).reversed()
+                .sorted(Comparator.comparingDouble((String t) -> hintCandidateScore(t, capturedFp))
+                        .reversed()
                         .thenComparing(String.CASE_INSENSITIVE_ORDER))
                 .collect(Collectors.toList());
     }
 
-    private double hintCandidateScore(String theme) {
+    private double hintCandidateScore(String theme, BuildFingerprint fp) {
         String key = theme.toLowerCase(Locale.ROOT);
         double score = 0.0;
+        // 1) Live block-vs-theme fit. This is the heart of the hint-aware
+        // ranking - 'diamond ring' wins for ['gold','diamond'] regardless of
+        // whether the scanner surfaced it pre-hint.
+        if (fp != null) {
+            score += scoreTheme(theme, fp);
+        }
+        // 2) If the scanner had already locked onto this theme pre-hint,
+        // fold its score in too (cached signal, complements the live score).
         for (ScoredTheme scoredTheme : lastScannerScores) {
             if (scoredTheme.theme().equalsIgnoreCase(key)) {
-                score += scoredTheme.score();
+                score += scoredTheme.score() * 0.5;
                 break;
             }
         }

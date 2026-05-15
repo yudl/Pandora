@@ -1,7 +1,9 @@
 package com.garous.pandora.module;
 
 import com.garous.pandora.config.PandoraConfig;
+import com.garous.pandora.module.modules.FullbrightModule;
 import com.garous.pandora.module.modules.GTBSolverModule;
+import com.garous.pandora.module.modules.HudModule;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -21,6 +23,8 @@ public class ModuleManager {
     private ModuleManager() {
         // Register modules
         register(new GTBSolverModule());
+        register(new FullbrightModule());
+        register(new HudModule());
         loadSavedModuleStates();
     }
 

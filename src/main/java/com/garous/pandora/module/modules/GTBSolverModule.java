@@ -6,6 +6,7 @@ import com.garous.pandora.module.Module;
 import com.garous.pandora.module.setting.BooleanSetting;
 import com.garous.pandora.module.setting.ModeSetting;
 import com.garous.pandora.module.setting.ModuleSetting;
+import com.garous.pandora.module.setting.NumberRangeSetting;
 import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
@@ -18,24 +19,35 @@ import java.util.List;
 public class GTBSolverModule extends Module {
 
     public static final String MODE_MANUAL = "manual";
-    public static final String MODE_AUTO_HINTS = "auto hints";
-    public static final String MODE_AUTO_HINTS_PREHINT = "auto hints + prehint";
+    public static final String MODE_AUTO_HINTS = "auto";
+    public static final String MODE_AUTO_HINTS_SCANNER = "auto + scanner";
+    // Back-compat: older configs may still hold these legacy mode strings.
+    public static final String LEGACY_MODE_AUTO_HINTS = "auto hints";
+    public static final String LEGACY_MODE_AUTO_HINTS_PREHINT = "auto hints + prehint";
 
     private final ModeSetting guessMode = new ModeSetting(
             "guess_mode",
-            "guess mode",
-            List.of(MODE_MANUAL, MODE_AUTO_HINTS, MODE_AUTO_HINTS_PREHINT),
+            "mode",
+            List.of(MODE_MANUAL, MODE_AUTO_HINTS, MODE_AUTO_HINTS_SCANNER),
             MODE_MANUAL
     );
-    private final BooleanSetting rotateMatches = new BooleanSetting("rotate_matches", "rotate matches", true);
-    private final BooleanSetting activeRoundOnly = new BooleanSetting("active_round_only", "active round only", true);
-    private final BooleanSetting guessHistoryHud = new BooleanSetting("guess_history_hud", "guess history hud", true);
+    private final NumberRangeSetting autoGuessDelay = new NumberRangeSetting(
+            "auto_guess_delay",
+            "delay",
+            1, 10, 3, 5, "s"
+    );
+    private final BooleanSetting rotateMatches = new BooleanSetting("rotate_matches", "rotate", true);
+    private final BooleanSetting activeRoundOnly = new BooleanSetting("active_round_only", "round-only", true);
+    private final BooleanSetting guessHistoryHud = new BooleanSetting("guess_history_hud", "history hud", true);
+    private final BooleanSetting automated = new BooleanSetting("automated", "automated", false);
 
     private final List<ModuleSetting<?>> settings = List.of(
             guessMode,
+            autoGuessDelay,
             rotateMatches,
             activeRoundOnly,
-            guessHistoryHud
+            guessHistoryHud,
+            automated
     );
 
     public GTBSolverModule() {
@@ -50,10 +62,43 @@ public class GTBSolverModule extends Module {
     @Override
     public void onConfigLoaded() {
         PandoraConfig config = PandoraConfig.getInstance();
-        guessMode.setValue(config.getModuleTextOption(getName(), guessMode.getId(), MODE_MANUAL));
+        String savedMode = config.getModuleTextOption(getName(), guessMode.getId(), MODE_MANUAL);
+        guessMode.setValue(migrateLegacyMode(savedMode));
+        loadDelayFromConfig(config);
         rotateMatches.setValue(config.getModuleOption(getName(), rotateMatches.getId(), true));
         activeRoundOnly.setValue(config.getModuleOption(getName(), activeRoundOnly.getId(), true));
         guessHistoryHud.setValue(config.getModuleOption(getName(), guessHistoryHud.getId(), true));
+        automated.setValue(config.getModuleOption(getName(), automated.getId(), false));
+        GTBSolverEngine.loadHudPositionFromConfig();
+    }
+
+    private void loadDelayFromConfig(PandoraConfig config) {
+        // Migrates the historical string presets ("3-5s") and reads back our
+        // own slider-encoded "low-high" strings.
+        String stored = config.getModuleTextOption(getName(), autoGuessDelay.getId(), "3-5");
+        try {
+            String trimmed = stored.replace("s", "").trim();
+            String[] parts = trimmed.split("-");
+            int lo = Integer.parseInt(parts[0].trim());
+            int hi = Integer.parseInt(parts[1].trim());
+            autoGuessDelay.setLow(lo);
+            autoGuessDelay.setHigh(hi);
+        } catch (Exception ignored) {
+            autoGuessDelay.setLow(3);
+            autoGuessDelay.setHigh(5);
+        }
+    }
+
+    public int[] getAutoGuessDelayMillis() {
+        return new int[]{autoGuessDelay.getLow() * 1000, autoGuessDelay.getHigh() * 1000};
+    }
+
+    private static String migrateLegacyMode(String value) {
+        if (value == null) return MODE_MANUAL;
+        String normalized = value.toLowerCase(java.util.Locale.ROOT).trim();
+        if (LEGACY_MODE_AUTO_HINTS_PREHINT.equals(normalized)) return MODE_AUTO_HINTS_SCANNER;
+        if (LEGACY_MODE_AUTO_HINTS.equals(normalized)) return MODE_AUTO_HINTS;
+        return normalized;
     }
 
     @Override
@@ -73,10 +118,15 @@ public class GTBSolverModule extends Module {
 
     @Override
     public void onTick() {
-        GTBSolverEngine.getInstance().tick(
+        int[] delay = getAutoGuessDelayMillis();
+        GTBSolverEngine engine = GTBSolverEngine.getInstance();
+        engine.setAutomatedMode(automated.getValue());
+        engine.tick(
                 guessMode.getValue(),
                 rotateMatches.getValue(),
-                activeRoundOnly.getValue()
+                activeRoundOnly.getValue(),
+                delay[0],
+                delay[1]
         );
     }
 
@@ -85,8 +135,8 @@ public class GTBSolverModule extends Module {
         if (!isEnabled()) {
             return "-";
         }
-        if (guessMode.is(MODE_AUTO_HINTS_PREHINT)) {
-            return "a+p";
+        if (guessMode.is(MODE_AUTO_HINTS_SCANNER)) {
+            return "a+s";
         }
         if (guessMode.is(MODE_AUTO_HINTS)) {
             return "a";
@@ -119,11 +169,11 @@ public class GTBSolverModule extends Module {
     }
 
     private String modeDescription() {
-        if (guessMode.is(MODE_AUTO_HINTS_PREHINT)) {
-            return "Auto rotates hint guesses and pre-hint plot reads.";
+        if (guessMode.is(MODE_AUTO_HINTS_SCANNER)) {
+            return "Auto-guesses hints and scans the build for pre-hint guesses.";
         }
         if (guessMode.is(MODE_AUTO_HINTS)) {
-            return "Auto rotates hint guesses.";
+            return "Auto-guesses hint matches.";
         }
         return "Manual clickable suggestions.";
     }

@@ -9,6 +9,8 @@ import com.google.gson.JsonObject;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.registry.Registries;
 import net.minecraft.scoreboard.Scoreboard;
 import net.minecraft.scoreboard.ScoreboardDisplaySlot;
@@ -21,7 +23,6 @@ import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
 
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -31,18 +32,23 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Guess The Build solver and heuristic build reader for modern Fabric.
+ * Guess The Build solver: hint matching + lightweight build scanner.
+ *
+ * Block scanning is fully event-driven (per-block-update packets routed via the
+ * Block/Chunk delta mixins). Plot detection no longer scans large world volumes
+ * every tick; it anchors once per round to the player's position with a tiny
+ * 6-block downward floor probe.
  */
 public class GTBSolverEngine {
 
@@ -51,107 +57,169 @@ public class GTBSolverEngine {
     private static final Pattern FORMATTING_CODE = Pattern.compile(Pattern.quote(String.valueOf(FORMAT_CODE)) + "[0-9a-fk-or]", Pattern.CASE_INSENSITIVE);
     private static final Pattern THEME_HINT = Pattern.compile("(?i).*\\b(?:theme|hint|word)\\b(?:\\s+(?:is|starts\\s+with|contains))?\\s*:?[\\s-]*(.+)$");
     private static final Pattern THEME_REVEAL = Pattern.compile("(?i).*theme was\\s*:?[\\s-]*(.+?)(?:[!.]|$)");
+    private static final Pattern ROUND_OF = Pattern.compile("(?i)round\\s*:?\\s*(\\d+)\\s*/\\s*(\\d+)");
+    // "+1 point" / "+2 points" / "+3 points" - Hypixel sends this to the
+    // player who guesses correctly, and only to them. Treat as a win signal.
+    private static final Pattern POINT_AWARD = Pattern.compile("(?i)\\+\\s*[123]\\s*points?\\b");
+    // Player chat lines from Hypixel look like:
+    //   [VIP] PlayerName: message
+    //   PlayerName: message
+    //   Guild > PlayerName: message
+    // We strip § codes first then test for an opening "<optional rank> <name>:"
+    // so a player typing "+1 point" never trips the win detector.
+    private static final Pattern PLAYER_CHAT_PREFIX = Pattern.compile(
+            "(?i)^(?:\\[[^\\]]+\\]\\s+)?(?:guild\\s*>\\s*)?(?:\\[[^\\]]+\\]\\s+)?[A-Za-z0-9_]{3,16}\\s*[:\\u00BB>]"
+    );
 
     private static final int MAX_DISPLAYED_MATCHES = 100;
     private static final long AUTO_GUESS_INTERVAL_MS = 3_000L;
-    private static final long PRE_HINT_SCAN_INTERVAL_MS = 700L;
-    private static final long GAME_SIGNAL_GRACE_MS = 20_000L;
-    private static final long ROUND_SIGNAL_GRACE_MS = 15_000L;
-    private static final long PLOT_SEARCH_INTERVAL_MS = 1_500L;
-    private static final int PLOT_HALF_SIZE = 13;
-    private static final int PLOT_SCAN_MIN_Y = -3;
-    private static final int PLOT_SCAN_MAX_Y = 32;
-    private static final int PRE_HINT_MIN_BLOCKS = 1;
-    private static final double PRE_HINT_MIN_SCORE = 5.0;
-    private static final double PRE_HINT_MIN_LEAD = 1.5;
-    private static final int PRE_HINT_MAX_CHANGED_BLOCKS = 700;
-    private static final int PLOT_SEARCH_RADIUS = 48;
-    private static final int PLOT_SEARCH_VERTICAL = 28;
-    private static final int MIN_WHITE_TERRACOTTA_FLOOR_BLOCKS = 20;
-    private static final int MAX_WHITE_TERRACOTTA_FLOOR_BLOCKS = 1_100;
-    private static final int MAX_PLOT_SPAN = 34;
-    private static final int HUD_X = 6;
-    private static final int HUD_Y = 18;
+    // Scanner re-scoring runs frequently for HUD freshness, but local 'scanner: X'
+    // chat notices are throttled to match the chat cooldown.
+    private static final long SCAN_INTERVAL_MS = 750L;
+    private static final long SCANNER_NOTICE_INTERVAL_MS = 3_000L;
+    private static final long ROUND_RE_ANCHOR_INTERVAL_MS = 750L;
+    private static final long GAME_SIGNAL_GRACE_MS = 30_000L;
+    private static final long ROUND_SIGNAL_GRACE_MS = 25_000L;
 
-    private static final Set<String> COLOR_WORDS = Set.of(
-            "white", "orange", "magenta", "light", "blue", "yellow", "lime", "pink", "gray", "grey",
-            "silver", "cyan", "purple", "brown", "green", "red", "black"
-    );
-    private static final Set<String> LEGACY_BLOCK_KEYWORDS = Set.of(
-            "stone", "grass", "dirt", "cobblestone", "wood", "planks", "sapling", "bedrock", "water",
-            "lava", "sand", "gravel", "gold", "iron", "coal", "log", "leaves", "sponge", "glass",
-            "lapis", "dispenser", "sandstone", "note", "bed", "rail", "detector", "piston", "wool",
-            "flower", "dandelion", "rose", "mushroom", "slab", "brick", "tnt", "bookshelf", "mossy",
-            "obsidian", "torch", "fire", "spawner", "stairs", "chest", "redstone", "diamond",
-            "crafting", "furnace", "ladder", "lever", "pressure", "button", "snow", "ice", "cactus",
-            "clay", "jukebox", "fence", "pumpkin", "netherrack", "soul", "glowstone", "trapdoor",
-            "stonebrick", "bars", "pane", "melon", "vine", "gate", "mycelium", "lily", "pad",
-            "nether", "cauldron", "enchanting", "brewing", "end", "dragon", "emerald", "beacon",
-            "anvil", "quartz", "hopper", "terracotta", "hay", "carpet", "packed", "slime",
-            "prismarine", "lantern", "sea"
-    );
-    private static final Set<String> ABSOLUTE_SCAN_IGNORES = Set.of(
-            "white_terracotta", "hardened_clay", "white_stained_hardened_clay", "stonebrick", "mossy_stonebrick",
-            "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks", "dark_oak_planks"
-    );
+    // Widened from 13/2/30 to cover the largest plot variants and any
+    // overflow blocks placed slightly outside the visible build pad. Plus
+    // a generous vertical envelope so very tall builds (rocket, tower,
+    // skyscraper) aren't truncated.
+    private static final int PLOT_HALF_SIZE = 18;       // 37x37 plot
+    private static final int PLOT_SCAN_BELOW = 4;       // scan 4 below floor
+    private static final int PLOT_SCAN_ABOVE = 50;      // 50 above floor
+    private static final int FLOOR_PROBE_RADIUS = 2;    // 5x5 floor lookup
+    private static final int FLOOR_PROBE_DEPTH = 6;     // search up to 6 below player
+    private static final int MAX_PLACED_BLOCKS = 1500;
+    private static final int MIN_SCAN_BLOCKS = 1;
+    private static final double MIN_SCAN_SCORE = 4.0;
+    private static final double SCAN_LEAD_THRESHOLD = 1.8;
+    private static final double SINGLE_BLOCK_LEAD_BONUS = 12.0;
+
+    // HUD position is movable; defaults match the historical fixed location.
+    // Drag with the dedicated HUD-edit screen (opened from PandoraClient).
+    private static volatile int hudOriginX = 6;
+    private static volatile int hudOriginY = 18;
+    public static int getHudOriginX() { return hudOriginX; }
+    public static int getHudOriginY() { return hudOriginY; }
+    public static void setHudOrigin(int x, int y) {
+        hudOriginX = Math.max(0, x);
+        hudOriginY = Math.max(0, y);
+        PandoraConfig.getInstance().setModuleTextOption("gtb solver", "hud_x", Integer.toString(hudOriginX));
+        PandoraConfig.getInstance().setModuleTextOption("gtb solver", "hud_y", Integer.toString(hudOriginY));
+    }
+    public static void loadHudPositionFromConfig() {
+        PandoraConfig c = PandoraConfig.getInstance();
+        try { hudOriginX = Integer.parseInt(c.getModuleTextOption("gtb solver", "hud_x", "6")); } catch (Exception ignored) {}
+        try { hudOriginY = Integer.parseInt(c.getModuleTextOption("gtb solver", "hud_y", "18")); } catch (Exception ignored) {}
+    }
+
     private static final Map<String, Double> COMMON_THEME_PRIORS = Map.ofEntries(
-            Map.entry("tree", 10.0),
-            Map.entry("house", 9.5),
-            Map.entry("car", 9.0),
-            Map.entry("dog", 8.5),
-            Map.entry("cat", 8.5),
-            Map.entry("flower", 8.0),
-            Map.entry("pizza", 7.8),
-            Map.entry("cake", 7.6),
-            Map.entry("calculator", 7.3),
-            Map.entry("book", 7.1),
-            Map.entry("cup", 7.0),
-            Map.entry("beach", 6.9),
-            Map.entry("bridge", 6.7),
-            Map.entry("castle", 6.6),
-            Map.entry("treehouse", 6.4),
-            Map.entry("traffic light", 6.2),
-            Map.entry("cloud", 6.0),
-            Map.entry("train", 5.8),
-            Map.entry("computer", 5.7),
-            Map.entry("orange juice", 5.5),
-            Map.entry("crafting table", 5.4),
-            Map.entry("swimming pool", 5.2)
+            Map.entry("tree", 8.0),
+            Map.entry("house", 7.0),
+            Map.entry("car", 6.5),
+            Map.entry("dog", 6.0),
+            Map.entry("cat", 6.0),
+            Map.entry("flower", 5.5),
+            Map.entry("pizza", 5.5),
+            Map.entry("cake", 5.0),
+            Map.entry("calculator", 4.5),
+            Map.entry("book", 4.5),
+            Map.entry("cup", 4.5),
+            Map.entry("beach", 4.5),
+            Map.entry("bridge", 4.5),
+            Map.entry("castle", 4.5),
+            Map.entry("treehouse", 4.0),
+            Map.entry("traffic light", 4.0),
+            Map.entry("cloud", 4.0),
+            Map.entry("train", 3.5),
+            Map.entry("computer", 3.5),
+            Map.entry("orange juice", 3.5),
+            Map.entry("crafting table", 3.5),
+            Map.entry("swimming pool", 3.5),
+            Map.entry("anvil", 3.5),
+            Map.entry("tnt", 3.5),
+            Map.entry("snowman", 3.5),
+            Map.entry("cactus", 3.0),
+            Map.entry("bookshelf", 3.0),
+            Map.entry("furnace", 3.0)
     );
 
     private static GTBSolverEngine instance;
 
     private final List<String> themeWords = new ArrayList<>();
     private final Map<String, String> shortestTranslationMap = new HashMap<>();
+    private final Map<String, Set<String>> themeTokenIndex = new HashMap<>();
+    private final Map<String, Set<String>> tokenToThemeKeys = new HashMap<>();
+    private final Map<String, String> themeKeyToOriginal = new HashMap<>();
 
+    // Hint state
     private String lastHint = "";
     private List<String> lastResults = new ArrayList<>();
     private List<String> pendingResults;
+
+    // Auto-guess state
     private final List<String> autoGuessQueue = new ArrayList<>();
     private final List<String> guessHistory = new ArrayList<>();
-    private final Map<String, Double> latestPreHintScores = new HashMap<>();
-    private final Map<Long, String> pendingPlotUpdates = new HashMap<>();
-    private final Map<Long, String> trackedPlotBlocks = new HashMap<>();
+    private final java.util.Random random = new java.util.Random();
+    private int autoGuessIndex;
+    private long lastAutoGuessAt;
+    private long nextAutoGuessDelayMs = AUTO_GUESS_INTERVAL_MS;
+    private int autoGuessMinDelayMs = 3_000;
+    private int autoGuessMaxDelayMs = 5_000;
+    private String lastSentGuess = "";
+    private boolean roundGuessLocked;
+    private boolean suppressEmptyMatchChat;
+
+    // Round / game signals
     private String activeRoundKey = "";
-    private String lastPreHintGuess = "";
-    private String lastPreHintTheme = "";
-    private String lastHudStatus = "waiting for GTB round";
+    private long lastGameSignalAt;
+    private long lastRoundSignalAt;
+    private long lastBuilderSignalAt;
+    private long lastHintSignalAt;
+    private long lastThemeSignalAt;
+    private long lastActiveRoundAt;
     private String lastRoundLabel = "";
     private String lastBuilderLabel = "";
     private String lastThemeLabel = "";
-    private int lastChangedBlockCount;
-    private long lastAutoGuessAt;
-    private long lastPreHintScanAt;
-    private long lastGameSignalAt;
-    private long lastHintSignalAt;
-    private long lastRoundSignalAt;
-    private long lastBuilderSignalAt;
-    private long lastThemeSignalAt;
-    private long lastActiveRoundAt;
-    private long lastPlotSearchAt;
-    private int autoGuessIndex;
-    private Map<Long, String> roundBaselineBlocks = new HashMap<>();
-    private PlotAnchor lastPlotAnchor = PlotAnchor.unknown();
+
+    // Scanner state
+    // ConcurrentHashMaps because Fabric's BlockUpdate/ChunkDeltaUpdate mixin runs
+    // on the network thread (the @At HEAD injection point fires before
+    // NetworkThreadUtils.forceMainThread reschedules the rest to the main thread).
+    private volatile PlotRegion plotRegion;
+    private final ConcurrentHashMap<Long, String> baseline = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, String> placed = new ConcurrentHashMap<>();
+    private long lastScanAt;
+    private long lastReanchorAt;
+    private String lastScannerGuess = "";
+    private String lastScannerTheme = "";
+    private long lastScannerNoticeAt;
+    private List<ScoredTheme> lastScannerScores = List.of();
+
+    // Automated farm mode
+    private boolean automatedMode;
+    private AutomatedState automatedState = AutomatedState.IDLE;
+    private long automatedNextActionAt;
+    private long lastWinnersSeenAt;
+    private boolean awaitingBuilderTurn;
+    // Set true when we send /play after a Winners line; cleared only when we
+    // detect a fresh round beginning (so the second 'Winners' recap line
+    // Hypixel posts ~10s later doesn't cause a second /play).
+    private boolean awaitingNewGame;
+
+    private enum AutomatedState {
+        IDLE,
+        AWAITING_THEME_GUI,  // builder turn detected, waiting for the chest GUI to open
+        SKIP_HUB,            // we're the builder, theme picked, sent /hub
+        SKIP_BACK,           // hub loaded, send /back
+        AWAITING_REJOIN,     // round ended, queue /play
+        IN_GAME
+    }
+
+    // HUD
+    private String hudStatus = "waiting for GTB round";
+    private int hudPlacedCount;
 
     public static GTBSolverEngine getInstance() {
         if (instance == null) {
@@ -162,7 +230,11 @@ public class GTBSolverEngine {
 
     private GTBSolverEngine() {
         loadTranslationData();
+        buildThemeTokenIndex();
+        GTBLearningStore.getInstance().load();
     }
+
+    // ===================== Public API =====================
 
     public void processActionBar(Text message) {
         noteGameSignal(message.getString());
@@ -177,12 +249,33 @@ public class GTBSolverEngine {
     }
 
     public void tick(String guessMode, boolean rotateMatches, boolean activeRoundOnly) {
+        tick(guessMode, rotateMatches, activeRoundOnly, 3_000, 5_000);
+    }
+
+    public void setAutomatedMode(boolean enabled) {
+        if (this.automatedMode == enabled) return;
+        this.automatedMode = enabled;
+        if (!enabled) {
+            this.automatedState = AutomatedState.IDLE;
+            this.awaitingBuilderTurn = false;
+            this.awaitingNewGame = false;
+            this.automatedNextActionAt = 0L;
+        }
+    }
+
+    public void tick(String guessMode, boolean rotateMatches, boolean activeRoundOnly,
+                     int minDelayMs, int maxDelayMs) {
+        this.autoGuessMinDelayMs = Math.max(500, minDelayMs);
+        this.autoGuessMaxDelayMs = Math.max(this.autoGuessMinDelayMs, maxDelayMs);
+        this.suppressEmptyMatchChat = !GTBSolverModule.MODE_MANUAL.equalsIgnoreCase(guessMode);
+        if (automatedMode) tickAutomated();
         flushPendingSuggestions();
 
         long now = System.currentTimeMillis();
         GameContext context = readGameContext();
+
         if (!context.inGuessTheBuild()) {
-            lastHudStatus = "not in GTB";
+            hudStatus = "not in GTB";
             if (now - lastGameSignalAt > GAME_SIGNAL_GRACE_MS) {
                 clearAutomationState();
             }
@@ -194,14 +287,11 @@ public class GTBSolverEngine {
         }
         if (context.activeRound()) {
             lastActiveRoundAt = now;
-            if (context.plotAnchor().isValid() && roundBaselineBlocks.isEmpty()) {
-                captureRoundBaseline(context.plotAnchor());
-            }
         }
 
         boolean hasRecentRound = context.activeRound() || now - lastActiveRoundAt < ROUND_SIGNAL_GRACE_MS;
         if (activeRoundOnly && !hasRecentRound) {
-            lastHudStatus = "waiting for active round";
+            hudStatus = "waiting for active round";
             if (now - lastGameSignalAt > GAME_SIGNAL_GRACE_MS) {
                 clearAutomationState();
             }
@@ -209,10 +299,10 @@ public class GTBSolverEngine {
         }
 
         boolean autoHints = !GTBSolverModule.MODE_MANUAL.equalsIgnoreCase(guessMode);
-        boolean autoPreHint = GTBSolverModule.MODE_AUTO_HINTS_PREHINT.equalsIgnoreCase(guessMode);
+        boolean useScanner = GTBSolverModule.MODE_AUTO_HINTS_SCANNER.equalsIgnoreCase(guessMode);
 
         if (!autoHints) {
-            lastHudStatus = "manual mode";
+            hudStatus = "manual mode";
             autoGuessQueue.clear();
             autoGuessIndex = 0;
             return;
@@ -221,20 +311,29 @@ public class GTBSolverEngine {
         if (context.revealedThemeVisible()) {
             autoGuessQueue.clear();
             autoGuessIndex = 0;
-            latestPreHintScores.clear();
-            lastHudStatus = "theme visible";
+            hudStatus = "theme visible";
             return;
         }
 
-        if (autoPreHint && context.allowPreHint()) {
-            scanPreHintGuess(context);
+        // The scanner runs as long as we're recognised as being in GTB. The
+        // earlier gate (require an "active round") meant scoreboards without a
+        // distinct Builder/Round line silently never kicked it in. Keeping the
+        // gate at inGuessTheBuild() lets the scanner run even pre-hint and in
+        // the pre-game lobby without harm — when there's no plot region it
+        // just no-ops.
+        if (useScanner) {
+            ensurePlotAnchor(now);
+            if (now - lastScanAt >= SCAN_INTERVAL_MS) {
+                lastScanAt = now;
+                runScannerScan();
+            }
         }
 
-        if (!lastHudStatus.startsWith("scan")
-                && !lastHudStatus.startsWith("no ")
-                && !lastHudStatus.startsWith("locking")
-                && !lastHudStatus.startsWith("prehint")) {
-            lastHudStatus = autoGuessQueue.isEmpty() ? "collecting guesses" : "auto guessing";
+        if (!hudStatus.startsWith("scanner")
+                && !hudStatus.startsWith("auto")
+                && !hudStatus.startsWith("queued")
+                && !hudStatus.startsWith("sent")) {
+            hudStatus = autoGuessQueue.isEmpty() ? "collecting guesses" : "auto guessing";
         }
         sendQueuedAutoGuess(rotateMatches);
     }
@@ -248,63 +347,98 @@ public class GTBSolverEngine {
             results = pendingResults;
             pendingResults = null;
         }
-
         sendSuggestions(results);
     }
 
     public void onBlockUpdate(BlockPos pos, BlockState state) {
-        if (activeRoundKey.isBlank() || !lastPlotAnchor.isValid()) {
+        if (plotRegion == null || !plotRegion.contains(pos)) {
             return;
         }
-        if (!isWithinTrackedPlot(pos, lastPlotAnchor)) {
-            return;
-        }
+        long packed = pos.asLong();
+        String newId = state.isAir() ? "air" : Registries.BLOCK.getId(state.getBlock()).getPath();
 
-        long packedPos = pos.asLong();
-        String blockId = Registries.BLOCK.getId(state.getBlock()).getPath();
-        if (roundBaselineBlocks.isEmpty()) {
-            pendingPlotUpdates.put(packedPos, state.isAir() ? "" : blockId);
+        // If we never sampled this position, treat the very first update as baseline.
+        // (Happens when chunks stream in after the round started.)
+        baseline.putIfAbsent(packed, newId);
+        String base = baseline.get(packed);
+
+        if (newId.equals(base) || GTBBlockSignatures.isLobbyBlock(newId)) {
+            placed.remove(packed);
             return;
         }
-
-        String baseline = roundBaselineBlocks.get(packedPos);
-        if (state.isAir()
-                || baseline == null
-                || blockId.equals(baseline)
-                || isIgnoredBuildBlock(blockId)) {
-            trackedPlotBlocks.remove(packedPos);
+        if (placed.size() >= MAX_PLACED_BLOCKS) {
             return;
         }
-
-        trackedPlotBlocks.put(packedPos, blockId);
+        placed.put(packed, newId);
     }
 
     public void renderGuessHistoryHud(DrawContext context) {
-        int width = 124;
+        int width = 144;
         int headerColor = 0xE014141A;
         int bodyColor = 0xD8101014;
         int accentColor = 0xFFFF4FD8;
         int textColor = 0xFFFFFFFF;
         int mutedColor = 0xFFB7B7C6;
-        int historySize = Math.min(Math.max(guessHistory.size(), 1), 6);
-        int height = 16 + historySize * 10;
+        int hintColor = 0xFFFFD050;
+        int scannerColor = 0xFF7DE38B;
 
-        context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + height, bodyColor);
-        context.fill(HUD_X, HUD_Y, HUD_X + width, HUD_Y + 14, headerColor);
-        context.fill(HUD_X, HUD_Y, HUD_X + 3, HUD_Y + 14, accentColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb guesses", HUD_X + 6, HUD_Y + 3, textColor);
-        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, lastChangedBlockCount + " blocks", HUD_X + width - 44, HUD_Y + 3, mutedColor);
+        // Build the lines we want to render, in order, then render them.
+        List<HudLine> lines = new ArrayList<>();
+        lines.add(new HudLine(hudStatus, mutedColor));
 
-        if (guessHistory.isEmpty()) {
-            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, lastHudStatus, HUD_X + 6, HUD_Y + 18, mutedColor);
-            return;
+        if (!lastRoundLabel.isBlank() || !lastBuilderLabel.isBlank()) {
+            String round = lastRoundLabel.isBlank() ? "?" : lastRoundLabel;
+            String builder = lastBuilderLabel.isBlank() ? "" : " · " + truncate(lastBuilderLabel, 14);
+            lines.add(new HudLine("round " + round + builder, textColor));
+        }
+        if (!lastHint.isBlank()) {
+            lines.add(new HudLine("hint: " + truncate(lastHint, 22), hintColor));
+        }
+        for (int i = 0; i < Math.min(lastScannerScores.size(), 3); i++) {
+            ScoredTheme st = lastScannerScores.get(i);
+            String label = (i == 0 ? "» " : "  ") + truncate(st.theme(), 18);
+            lines.add(new HudLine(label, i == 0 ? scannerColor : mutedColor));
+        }
+        GTBLearningStore store = GTBLearningStore.getInstance();
+        lines.add(new HudLine("db: " + store.size() + " themes / " + store.totalRoundsObserved() + " rounds", 0xFF7799BB));
+        if (!guessHistory.isEmpty()) {
+            lines.add(new HudLine("--- recent ---", 0xFF55555F));
+            int historySize = Math.min(guessHistory.size(), 4);
+            for (int index = 0; index < historySize; index++) {
+                String guess = guessHistory.get(guessHistory.size() - 1 - index);
+                lines.add(new HudLine(truncate(guess, 22), mutedColor));
+            }
         }
 
-        for (int index = 0; index < historySize; index++) {
-            String guess = guessHistory.get(guessHistory.size() - 1 - index);
-            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, guess, HUD_X + 6, HUD_Y + 18 + index * 10, mutedColor);
+        int height = 16 + lines.size() * 10;
+        int x0 = hudOriginX, y0 = hudOriginY;
+        context.fill(x0, y0, x0 + width, y0 + height, bodyColor);
+        context.fill(x0, y0, x0 + width, y0 + 14, headerColor);
+        context.fill(x0, y0, x0 + 3, y0 + 14, accentColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, "gtb scanner", x0 + 6, y0 + 3, textColor);
+        context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, hudPlacedCount + " blocks", x0 + width - 56, y0 + 3, mutedColor);
+
+        for (int i = 0; i < lines.size(); i++) {
+            HudLine line = lines.get(i);
+            context.drawTextWithShadow(MinecraftClient.getInstance().textRenderer, line.text, x0 + 6, y0 + 18 + i * 10, line.color);
         }
     }
+
+    /** Bounds used by the HUD-edit screen to test mouse hover / drag. */
+    public int[] getHudBounds() {
+        int width = 144;
+        // Approximate height; close enough for drag-bounds.
+        int height = 16 + Math.max(1, 6) * 10;
+        return new int[]{hudOriginX, hudOriginY, width, height};
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, Math.max(0, max - 1)) + "…";
+    }
+
+    private record HudLine(String text, int color) {}
 
     public void reset() {
         lastHint = "";
@@ -312,145 +446,209 @@ public class GTBSolverEngine {
         pendingResults = null;
         autoGuessQueue.clear();
         guessHistory.clear();
-        latestPreHintScores.clear();
+        autoGuessIndex = 0;
+        lastAutoGuessAt = 0L;
         activeRoundKey = "";
-        lastPreHintGuess = "";
-        lastPreHintTheme = "";
-        lastHudStatus = "waiting for GTB round";
+        lastGameSignalAt = 0L;
+        lastRoundSignalAt = 0L;
+        lastBuilderSignalAt = 0L;
+        lastHintSignalAt = 0L;
+        lastThemeSignalAt = 0L;
+        lastActiveRoundAt = 0L;
         lastRoundLabel = "";
         lastBuilderLabel = "";
         lastThemeLabel = "";
-        lastChangedBlockCount = 0;
-        lastAutoGuessAt = 0L;
-        lastPreHintScanAt = 0L;
-        lastGameSignalAt = 0L;
-        lastHintSignalAt = 0L;
-        lastRoundSignalAt = 0L;
-        lastBuilderSignalAt = 0L;
-        lastThemeSignalAt = 0L;
-        lastActiveRoundAt = 0L;
-        lastPlotSearchAt = 0L;
-        autoGuessIndex = 0;
-        roundBaselineBlocks = new HashMap<>();
-        pendingPlotUpdates.clear();
-        trackedPlotBlocks.clear();
-        lastPlotAnchor = PlotAnchor.unknown();
+        plotRegion = null;
+        baseline.clear();
+        placed.clear();
+        lastScanAt = 0L;
+        lastReanchorAt = 0L;
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
+        hudStatus = "waiting for GTB round";
+        hudPlacedCount = 0;
+        automatedState = AutomatedState.IDLE;
+        automatedNextActionAt = 0L;
+        awaitingBuilderTurn = false;
+        awaitingNewGame = false;
     }
+
+    public String getShortestTranslation(String englishWord) {
+        return shortestTranslationMap.getOrDefault(englishWord.toLowerCase(Locale.ROOT), englishWord);
+    }
+
+    public List<String> getThemeWords() {
+        return Collections.unmodifiableList(themeWords);
+    }
+
+    // ===================== Theme loading =====================
 
     private void loadTranslationData() {
         Set<String> seenThemes = new HashSet<>();
+        loadThemeResource("/assets/pandora/translations-data.json", seenThemes, true);
+        // Themes that were in older versions of GTB but were dropped from the
+        // current bundled list. Loaded so the bot can still guess them if
+        // Hypixel cycles them back in. ~287 extra themes.
+        loadThemeResource("/assets/pandora/translations-extra.json", seenThemes, false);
+        themeWords.sort(String.CASE_INSENSITIVE_ORDER);
+        Pandora.LOGGER.info("[GTBSolver] Loaded {} Guess The Build themes.", themeWords.size());
+    }
 
-        try (InputStream stream = getClass().getResourceAsStream("/assets/pandora/translations-data.json")) {
+    private void loadThemeResource(String path, Set<String> seenThemes, boolean requireResource) {
+        try (InputStream stream = getClass().getResourceAsStream(path)) {
             if (stream == null) {
-                Pandora.LOGGER.error("[GTBSolver] translations-data.json not found in resources.");
+                if (requireResource) Pandora.LOGGER.error("[GTBSolver] {} not found in resources.", path);
                 return;
             }
-
             JsonArray array = new Gson().fromJson(new InputStreamReader(stream, StandardCharsets.UTF_8), JsonArray.class);
             for (JsonElement element : array) {
-                if (!element.isJsonObject()) {
-                    continue;
-                }
-
+                if (!element.isJsonObject()) continue;
                 JsonObject entry = element.getAsJsonObject();
-                if (!entry.has("theme")) {
-                    continue;
-                }
-
+                if (!entry.has("theme")) continue;
                 String theme = clean(entry.get("theme").getAsString());
-                if (theme.isEmpty()) {
-                    continue;
-                }
-
+                if (theme.isEmpty()) continue;
                 String key = theme.toLowerCase(Locale.ROOT);
-                if (seenThemes.add(key)) {
-                    themeWords.add(theme);
-                }
-
-                shortestTranslationMap.put(key, findShortestTranslation(entry, theme));
+                if (seenThemes.add(key)) themeWords.add(theme);
+                shortestTranslationMap.putIfAbsent(key, findShortestTranslation(entry, theme));
             }
-
-            themeWords.sort(String.CASE_INSENSITIVE_ORDER);
-            Pandora.LOGGER.info("[GTBSolver] Loaded {} Guess The Build themes.", themeWords.size());
         } catch (Exception exception) {
-            Pandora.LOGGER.error("[GTBSolver] Failed to load translations-data.json.", exception);
+            Pandora.LOGGER.error("[GTBSolver] Failed to load {}.", path, exception);
         }
     }
 
     private String findShortestTranslation(JsonObject entry, String englishTheme) {
         String shortest = englishTheme;
         int shortestLength = codePointLength(shortest);
-
-        if (!entry.has("translations") || !entry.get("translations").isJsonObject()) {
-            return shortest;
-        }
-
+        if (!entry.has("translations") || !entry.get("translations").isJsonObject()) return shortest;
         for (Map.Entry<String, JsonElement> language : entry.getAsJsonObject("translations").entrySet()) {
-            if (!language.getValue().isJsonObject()) {
-                continue;
-            }
-
+            if (!language.getValue().isJsonObject()) continue;
             JsonObject translationObject = language.getValue().getAsJsonObject();
-            if (!translationObject.has("translation")) {
-                continue;
-            }
-
+            if (!translationObject.has("translation")) continue;
             String translation = clean(translationObject.get("translation").getAsString());
-            if (translation.isEmpty()) {
-                continue;
-            }
-
+            if (translation.isEmpty()) continue;
             int length = codePointLength(translation);
             if (length < shortestLength) {
                 shortest = translation;
                 shortestLength = length;
             }
         }
-
         return shortest;
     }
 
-    private Optional<String> extractHint(Text message, boolean allowLooseHint) {
-        Optional<String> styledHint = extractYellowText(message);
-        if (styledHint.isPresent()) {
-            return styledHint;
+    private void buildThemeTokenIndex() {
+        for (String theme : themeWords) {
+            String key = theme.toLowerCase(Locale.ROOT);
+            themeKeyToOriginal.put(key, theme);
+            Set<String> tokens = themeNameTokens(theme);
+            themeTokenIndex.put(key, tokens);
+            for (String token : tokens) {
+                tokenToThemeKeys.computeIfAbsent(token, t -> new HashSet<>()).add(key);
+            }
         }
+    }
+
+    private static Set<String> themeNameTokens(String theme) {
+        String normalized = theme.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").trim();
+        Set<String> tokens = new HashSet<>();
+        for (String part : normalized.split("\\s+")) {
+            if (!part.isBlank() && part.length() >= 2) {
+                tokens.add(part);
+            }
+        }
+        return tokens;
+    }
+
+    // ===================== Hint extraction =====================
+
+    private Optional<String> extractHint(Text message, boolean allowLooseHint) {
+        // Reject obvious chat lines that aren't hints (player joins/leaves with
+        // underscores in their names used to set lastHint = "<playername>").
+        String rawPlain = stripFormatting(message.getString()).toLowerCase(Locale.ROOT);
+        if (isJoinOrLeaveLine(rawPlain)) return Optional.empty();
+
+        Optional<String> styledHint = extractYellowText(message);
+        if (styledHint.isPresent()) return styledHint;
 
         String plain = message.getString();
-        if (!plain.contains("_")) {
-            return Optional.empty();
-        }
+        if (!plain.contains("_")) return Optional.empty();
 
         String plainWithoutFormatting = stripFormatting(plain);
         int colonIndex = plainWithoutFormatting.lastIndexOf(':');
         if (colonIndex >= 0 && plainWithoutFormatting.substring(colonIndex + 1).contains("_")) {
-            return normalizeHint(plainWithoutFormatting.substring(colonIndex + 1));
+            String candidate = plainWithoutFormatting.substring(colonIndex + 1);
+            if (looksLikeHint(candidate)) return normalizeHint(candidate);
         }
-
         Matcher themeMatcher = THEME_HINT.matcher(plainWithoutFormatting);
         if (themeMatcher.matches() && themeMatcher.group(1).contains("_")) {
-            return normalizeHint(themeMatcher.group(1));
+            String candidate = themeMatcher.group(1);
+            if (looksLikeHint(candidate)) return normalizeHint(candidate);
         }
-
         Matcher legacyMatcher = LEGACY_YELLOW_HINT.matcher(plain);
         if (legacyMatcher.find()) {
-            return normalizeHint(legacyMatcher.group());
+            String candidate = legacyMatcher.group();
+            if (looksLikeHint(candidate)) return normalizeHint(candidate);
         }
-
-        return allowLooseHint ? extractLooseHintRun(plainWithoutFormatting) : Optional.empty();
+        if (!allowLooseHint) return Optional.empty();
+        Optional<String> loose = extractLooseHintRun(plainWithoutFormatting);
+        return loose.filter(this::looksLikeHint);
     }
 
     private Optional<String> extractYellowText(Text message) {
         StringBuilder hint = new StringBuilder();
-
         message.visit((style, text) -> {
             if (style.getColor() != null && "yellow".equals(style.getColor().getName()) && text.contains("_")) {
                 hint.append(text);
             }
             return Optional.empty();
         }, Style.EMPTY);
+        String collected = hint.toString();
+        if (!looksLikeHint(collected)) return Optional.empty();
+        return normalizeHint(collected);
+    }
 
-        return normalizeHint(hint.toString());
+    /**
+     * Heuristic: a real GTB hint is mostly underscores with at most a few
+     * revealed letters per token. Player names like "Steve_123" or chat lines
+     * with stray underscores fail this check.
+     */
+    private boolean looksLikeHint(String raw) {
+        if (raw == null) return false;
+        String s = stripFormatting(raw).trim();
+        if (s.isEmpty()) return false;
+        long underscores = s.chars().filter(c -> c == '_').count();
+        if (underscores == 0) return false;
+        long letters = s.chars().filter(Character::isLetter).count();
+        // Players names usually have >=4 letters and at most one underscore.
+        if (underscores == 1 && letters >= 4) return false;
+        // A real hint has roughly as many underscores as letters; reject lines
+        // dominated by letters.
+        if (letters > underscores * 2 + 2) return false;
+        // Reject any token with more than 3 consecutive revealed letters - real
+        // hints reveal letters one at a time and don't leave long letter runs.
+        int run = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isLetter(c)) {
+                run++;
+                if (run > 3) return false;
+            } else {
+                run = 0;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isJoinOrLeaveLine(String lower) {
+        return lower.contains("joined the lobby")
+                || lower.contains("joined the game")
+                || lower.contains("left the lobby")
+                || lower.contains("left the game")
+                || lower.contains(" disconnected")
+                || lower.contains(" reconnected")
+                || lower.contains("kicked from")
+                || lower.contains("party invite")
+                || lower.contains("friend request");
     }
 
     private Optional<String> normalizeHint(String rawHint) {
@@ -458,11 +656,7 @@ public class GTBSolverEngine {
         hint = hint.replaceAll("[^\\p{L}\\p{N}_ '\\-]", " ");
         hint = hint.replaceAll("\\s+", " ");
         hint = clean(hint).toLowerCase(Locale.ROOT);
-
-        if (!hint.contains("_") || hint.length() > 80) {
-            return Optional.empty();
-        }
-
+        if (!hint.contains("_") || hint.length() > 80) return Optional.empty();
         return Optional.of(hint);
     }
 
@@ -471,46 +665,38 @@ public class GTBSolverEngine {
         List<String> tokens = new ArrayList<>();
         for (String token : rawTokens) {
             String cleaned = token.replaceAll("^[^\\p{L}\\p{N}_]+|[^\\p{L}\\p{N}_]+$", "");
-            if (!cleaned.isEmpty()) {
-                tokens.add(cleaned);
-            }
+            if (!cleaned.isEmpty()) tokens.add(cleaned);
         }
-
         int firstHintToken = -1;
         int lastHintToken = -1;
         for (int index = 0; index < tokens.size(); index++) {
             if (tokens.get(index).contains("_")) {
-                if (firstHintToken == -1) {
-                    firstHintToken = index;
-                }
+                if (firstHintToken == -1) firstHintToken = index;
                 lastHintToken = index;
             }
         }
-
-        if (firstHintToken == -1) {
-            return Optional.empty();
-        }
-
+        if (firstHintToken == -1) return Optional.empty();
         return normalizeHint(String.join(" ", tokens.subList(firstHintToken, lastHintToken + 1)));
     }
 
     private void processHint(String hint) {
-        if (hint.equals(lastHint)) {
-            return;
-        }
+        if (hint.equals(lastHint)) return;
         lastHintSignalAt = System.currentTimeMillis();
         lastThemeSignalAt = lastHintSignalAt;
         lastActiveRoundAt = lastHintSignalAt;
         lastHint = hint;
 
         List<String> matches = rankHintMatches(findHintMatches(hint));
-
-        if (matches.equals(lastResults) && !matches.isEmpty()) {
-            return;
-        }
+        if (matches.equals(lastResults) && !matches.isEmpty()) return;
 
         lastResults = matches;
-        updateAutoGuessQueue(matches);
+        // Auto-guess queue only takes the top 3 by block fit. The full match
+        // list (lastResults) is kept for the /command chat dump.
+        // Without this cap the bot rotates through every hint-compatible
+        // word ('p_zza' has dozens of matches), guessing weak fits one at
+        // a time. Top-3 lets us rotate among only the best block-fits.
+        List<String> queue = matches.size() > 3 ? new ArrayList<>(matches.subList(0, 3)) : matches;
+        updateAutoGuessQueue(queue);
         synchronized (this) {
             pendingResults = matches;
         }
@@ -518,102 +704,102 @@ public class GTBSolverEngine {
 
     private List<String> findHintMatches(String hint) {
         int length = hint.length();
-        long spaces = hint.chars().filter(character -> character == ' ').count();
-
-        List<int[]> revealedCharacters = new ArrayList<>();
-        for (int index = 0; index < hint.length(); index++) {
-            char character = hint.charAt(index);
-            if (character != '_' && character != ' ') {
-                revealedCharacters.add(new int[]{index, character});
-            }
+        long spaces = hint.chars().filter(c -> c == ' ').count();
+        List<int[]> revealed = new ArrayList<>();
+        for (int i = 0; i < hint.length(); i++) {
+            char c = hint.charAt(i);
+            if (c != '_' && c != ' ') revealed.add(new int[]{i, c});
         }
-
         return themeWords.stream()
                 .filter(word -> word.length() == length)
-                .filter(word -> word.chars().filter(character -> character == ' ').count() == spaces)
-                .filter(word -> matchesRevealedCharacters(word, revealedCharacters))
-                .collect(Collectors.toCollection(LinkedHashSet::new))
-                .stream()
+                .filter(word -> word.chars().filter(c -> c == ' ').count() == spaces)
+                .filter(word -> matchesRevealedCharacters(word, revealed))
                 .collect(Collectors.toList());
     }
 
     private List<String> rankHintMatches(List<String> matches) {
+        // When a hint arrives, score EVERY hint-compatible word against the
+        // currently placed blocks. This is what makes hints like "p__" prefer
+        // 'pig' over 'pie' if pig fits the blocks better - rather than
+        // ranking purely by what the scanner happened to surface pre-hint.
+        BuildFingerprint fp = (plotRegion != null && !placed.isEmpty())
+                ? BuildFingerprint.fromPlaced(placed, plotRegion)
+                : null;
+        if (fp != null) {
+            String builderHeldToken = readBuilderHeldBlockToken();
+            if (builderHeldToken != null) fp.addExtraToken(builderHeldToken);
+        }
+        final BuildFingerprint capturedFp = fp;
         return matches.stream()
-                .sorted(Comparator.comparingDouble(this::hintCandidateScore).reversed()
+                .sorted(Comparator.comparingDouble((String t) -> hintCandidateScore(t, capturedFp))
+                        .reversed()
                         .thenComparing(String.CASE_INSENSITIVE_ORDER))
                 .collect(Collectors.toList());
     }
 
-    private List<String> fallbackHintCandidates() {
-        return latestPreHintScores.entrySet().stream()
-                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                .limit(8)
-                .map(entry -> themeWords.stream()
-                        .filter(theme -> theme.equalsIgnoreCase(entry.getKey()))
-                        .findFirst()
-                        .orElse(entry.getKey()))
-                .collect(Collectors.toList());
-    }
-
-    private double hintCandidateScore(String theme) {
+    private double hintCandidateScore(String theme, BuildFingerprint fp) {
         String key = theme.toLowerCase(Locale.ROOT);
-        double score = latestPreHintScores.getOrDefault(key, 0.0);
-        score += frequencyBias(theme);
-        if (theme.equalsIgnoreCase(lastPreHintTheme)) {
-            score += 8.0;
+        double score = 0.0;
+        // 1) Live block-vs-theme fit, weighted heavily. Without this multiplier
+        // generic 'popular' themes (computer, robot, ...) outranked themes
+        // whose blocks were literally on screen, because frequency / priors
+        // contributed comparable points. We want block evidence to dominate.
+        if (fp != null) {
+            score += scoreTheme(theme, fp) * 4.0;
         }
+        // 2) Cached scanner pre-hint score, light contribution.
+        for (ScoredTheme scoredTheme : lastScannerScores) {
+            if (scoredTheme.theme().equalsIgnoreCase(key)) {
+                score += scoredTheme.score() * 0.5;
+                break;
+            }
+        }
+        // 3) Tiebreakers only - kept small so a single block match still wins
+        // over a popular-but-unrelated theme.
+        score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0) * 0.2;
+        score += PandoraConfig.getInstance().getThemeFrequency(theme) * 0.3;
+        if (theme.equalsIgnoreCase(lastScannerTheme)) score += 8.0;
         return score;
     }
 
-    private double frequencyBias(String theme) {
-        String normalized = normalizeTheme(theme);
-        return COMMON_THEME_PRIORS.getOrDefault(normalized, 0.0)
-                + PandoraConfig.getInstance().getThemeFrequency(theme) * 1.15;
-    }
-
-    private boolean matchesRevealedCharacters(String word, List<int[]> revealedCharacters) {
+    private boolean matchesRevealedCharacters(String word, List<int[]> revealed) {
         String lowerWord = word.toLowerCase(Locale.ROOT);
-        for (int[] revealed : revealedCharacters) {
-            if (lowerWord.charAt(revealed[0]) != (char) revealed[1]) {
-                return false;
-            }
+        for (int[] r : revealed) {
+            if (lowerWord.charAt(r[0]) != (char) r[1]) return false;
         }
         return true;
     }
 
     private void updateAutoGuessQueue(List<String> englishCandidates) {
-        if (englishCandidates.equals(autoGuessQueue)) {
-            return;
-        }
+        if (englishCandidates.equals(autoGuessQueue)) return;
         autoGuessQueue.clear();
         autoGuessQueue.addAll(englishCandidates);
         autoGuessIndex = 0;
-        lastAutoGuessAt = 0L;
-        if (!englishCandidates.isEmpty()) {
-            lastHudStatus = "queued " + englishCandidates.size() + " guesses";
-        }
+        // NOTE: don't reset lastAutoGuessAt here. The scanner reranks every
+        // ~750ms as new blocks arrive; resetting the cooldown made every queue
+        // shuffle fire an immediate guess (the spam bug). The cooldown is now
+        // only reset at the start of a round (beginRound()).
+        if (!englishCandidates.isEmpty()) hudStatus = "queued " + englishCandidates.size();
     }
 
     private void sendSuggestions(List<String> matches) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null) {
-            return;
-        }
-
+        if (client.player == null) return;
         if (matches.isEmpty()) {
-            client.player.sendMessage(prefix().append(Text.literal("No GTB matches found.").formatted(Formatting.GRAY)), false);
-            lastHudStatus = "no hint matches";
+            // In auto modes, surfacing this on every hint update creates chat
+            // spam — keep it to a quiet HUD-only update.
+            if (!suppressEmptyMatchChat) {
+                client.player.sendMessage(prefix().append(Text.literal("No GTB matches found.").formatted(Formatting.GRAY)), false);
+            }
+            hudStatus = "no hint matches";
             return;
         }
-
         client.player.sendMessage(prefix()
                 .append(Text.literal("GTB Solver ").formatted(Formatting.GRAY))
                 .append(Text.literal("(" + matches.size() + " matches)").formatted(Formatting.YELLOW)), false);
-
-        for (int index = 0; index < Math.min(matches.size(), MAX_DISPLAYED_MATCHES); index++) {
-            client.player.sendMessage(createSuggestionEntry(matches.get(index)), false);
+        for (int i = 0; i < Math.min(matches.size(), MAX_DISPLAYED_MATCHES); i++) {
+            client.player.sendMessage(createSuggestionEntry(matches.get(i)), false);
         }
-
         if (matches.size() > MAX_DISPLAYED_MATCHES) {
             client.player.sendMessage(prefix()
                     .append(Text.literal("... and " + (matches.size() - MAX_DISPLAYED_MATCHES) + " more.").formatted(Formatting.DARK_GRAY)), false);
@@ -621,23 +807,25 @@ public class GTBSolverEngine {
     }
 
     private void sendQueuedAutoGuess(boolean rotateMatches) {
-        if (autoGuessQueue.isEmpty()) {
-            return;
-        }
-
+        if (autoGuessQueue.isEmpty()) return;
+        if (roundGuessLocked) return;
         long now = System.currentTimeMillis();
-        if (now - lastAutoGuessAt < AUTO_GUESS_INTERVAL_MS) {
-            return;
-        }
-
-        int queueIndex = rotateMatches && autoGuessQueue.size() > 1 ? autoGuessIndex % autoGuessQueue.size() : 0;
+        if (now - lastAutoGuessAt < nextAutoGuessDelayMs) return;
+        // Pre-hint: queue[0] is always the scanner's best (highest score). Don't
+        // rotate, otherwise the HUD shows "scanner: shield" but the bot types
+        // a different theme from later in the queue.
+        boolean rotateNow = rotateMatches && !lastHint.isBlank() && autoGuessQueue.size() > 1;
+        int queueIndex = rotateNow ? autoGuessIndex % autoGuessQueue.size() : 0;
         String englishGuess = autoGuessQueue.get(queueIndex);
         String translatedGuess = getShortestTranslation(englishGuess);
-
         if (sendChatMessage(translatedGuess)) {
             lastAutoGuessAt = now;
-            lastHudStatus = "sent " + translatedGuess;
-            if (rotateMatches && autoGuessQueue.size() > 1) {
+            lastSentGuess = translatedGuess;
+            // Roll a fresh random delay for the next send so the cadence varies.
+            int spread = autoGuessMaxDelayMs - autoGuessMinDelayMs;
+            nextAutoGuessDelayMs = autoGuessMinDelayMs + (spread > 0 ? random.nextInt(spread + 1) : 0);
+            hudStatus = "sent " + translatedGuess;
+            if (rotateNow) {
                 autoGuessIndex = (autoGuessIndex + 1) % autoGuessQueue.size();
             }
         }
@@ -645,10 +833,7 @@ public class GTBSolverEngine {
 
     private boolean sendChatMessage(String message) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.getNetworkHandler() == null) {
-            return false;
-        }
-
+        if (client.player == null || client.getNetworkHandler() == null) return false;
         client.getNetworkHandler().sendChatMessage(message);
         appendGuessHistory(message);
         return true;
@@ -656,361 +841,615 @@ public class GTBSolverEngine {
 
     private void appendGuessHistory(String guess) {
         guessHistory.add(guess);
-        while (guessHistory.size() > 12) {
-            guessHistory.removeFirst();
-        }
+        while (guessHistory.size() > 12) guessHistory.removeFirst();
     }
 
     private void noteGameSignal(String message) {
-        String plainMessage = stripFormatting(message).trim();
-        String lowerMessage = plainMessage.toLowerCase(Locale.ROOT);
+        String plain = stripFormatting(message).trim();
+        String lower = plain.toLowerCase(Locale.ROOT);
+        boolean fromPlayer = looksLikePlayerChat(plain);
         long now = System.currentTimeMillis();
-        if (lowerMessage.contains("guess the build")
-                || lowerMessage.contains("builder:")
-                || lowerMessage.contains("round:")
-                || lowerMessage.contains("theme:")
-                || lowerMessage.contains("you guessed")
-                || lowerMessage.contains("_")) {
+        if (lower.contains("guess the build") || lower.contains("builder:") || lower.contains("round:")
+                || lower.contains("theme:") || lower.contains("you guessed") || lower.contains("_")
+                || ROUND_OF.matcher(plain).find()) {
             lastGameSignalAt = now;
         }
-
-        if (lowerMessage.contains("round:")) {
+        if (lower.contains("round:") || ROUND_OF.matcher(plain).find()) {
             lastRoundSignalAt = now;
-            lastRoundLabel = extractValueAfterColon(plainMessage, "round");
+            lastRoundLabel = extractValueAfterColon(plain, "round");
+            if (lastRoundLabel.isBlank()) {
+                Matcher m = ROUND_OF.matcher(plain);
+                if (m.find()) lastRoundLabel = m.group(1) + "/" + m.group(2);
+            }
         }
-        if (lowerMessage.contains("builder:")) {
+        if (lower.contains("builder:")) {
             lastBuilderSignalAt = now;
-            lastBuilderLabel = extractValueAfterColon(plainMessage, "builder");
+            lastBuilderLabel = extractValueAfterColon(plain, "builder");
         }
-        if (lowerMessage.contains("theme:")) {
+        if (lower.contains("theme:")) {
             lastThemeSignalAt = now;
-            lastThemeLabel = extractValueAfterColon(plainMessage, "theme");
+            lastThemeLabel = extractValueAfterColon(plain, "theme");
         }
+
+        // Automated farm hooks: detect when we are the builder this round
+        // (Hypixel shows "You are the builder!" or "It's your turn to build")
+        // and when a game ends (the "Winners" recap appears).
+        // We hard-skip these triggers if the line is a player chat message so
+        // someone typing 'Winners 1st' or '+1 point' can't drive the bot.
+        if (automatedMode && !fromPlayer) {
+            if ((lower.contains("your turn to build")
+                    || lower.contains("you are the builder")
+                    || lower.contains("you are now building"))
+                    && !awaitingBuilderTurn) {
+                triggerSkipTurnIfBuilder();
+            }
+            if (lower.startsWith("winners") || lower.contains("game over!")
+                    || lower.contains("1st place") || lower.contains("first place")) {
+                triggerRejoinIfAutomated();
+            }
+        }
+    }
+
+    /** True if this chat line was almost certainly authored by another player. */
+    private static boolean looksLikePlayerChat(String plain) {
+        if (plain == null || plain.isEmpty()) return false;
+        return PLAYER_CHAT_PREFIX.matcher(plain).find();
     }
 
     private void handleThemeReveal(String message) {
         String plain = stripFormatting(message).trim();
         Matcher matcher = THEME_REVEAL.matcher(plain);
-        if (!matcher.matches()) {
-            return;
-        }
-
-        String revealedTheme = clean(matcher.group(1));
-        if (revealedTheme.isEmpty()) {
-            return;
-        }
-
+        if (!matcher.matches()) return;
+        String revealed = clean(matcher.group(1));
+        if (revealed.isEmpty()) return;
         lastThemeSignalAt = System.currentTimeMillis();
-        lastThemeLabel = revealedTheme;
-
+        lastThemeLabel = revealed;
         PandoraConfig config = PandoraConfig.getInstance();
-        config.incrementThemeFrequency(revealedTheme);
-        if (revealedTheme.equalsIgnoreCase(lastPreHintTheme)) {
-            config.incrementThemeFrequency(revealedTheme);
+        config.incrementThemeFrequency(revealed);
+        if (revealed.equalsIgnoreCase(lastScannerTheme)) config.incrementThemeFrequency(revealed);
+
+        // Record the round in the learning store so the next time this theme
+        // (or one with similar blocks) appears, the scanner has prior knowledge.
+        // We record both aggregated token counts AND the full block layout
+        // (relative coords -> id) so future scoring can inspect actual shapes.
+        Map<String, Integer> tokensSeen = collectTokenCounts();
+        Map<String, String> layout = collectBlockLayout();
+        if (!tokensSeen.isEmpty() || !layout.isEmpty() || !guessHistory.isEmpty()) {
+            GTBLearningStore.getInstance().recordRound(revealed, tokensSeen,
+                    new ArrayList<>(guessHistory), layout);
         }
+    }
+
+    private Map<String, Integer> collectTokenCounts() {
+        if (plotRegion == null || placed.isEmpty()) return Map.of();
+        BuildFingerprint fp = BuildFingerprint.fromPlaced(placed, plotRegion);
+        Map<String, Integer> counts = new HashMap<>();
+        for (String token : fp.tokens()) {
+            counts.put(token, fp.tokenCount(token));
+        }
+        return counts;
+    }
+
+    /**
+     * Snapshot of placed blocks keyed by coordinates relative to the plot
+     * centre, so the same theme rebuilt on a different plot lands in the same
+     * coordinate space.
+     */
+    private Map<String, String> collectBlockLayout() {
+        if (plotRegion == null || placed.isEmpty()) return Map.of();
+        Map<String, String> layout = new HashMap<>();
+        Map<Long, String> snapshot = new HashMap<>(placed);
+        for (Map.Entry<Long, String> entry : snapshot.entrySet()) {
+            BlockPos pos = BlockPos.fromLong(entry.getKey());
+            String key = (pos.getX() - plotRegion.centerX) + ","
+                    + (pos.getY() - plotRegion.floorY) + ","
+                    + (pos.getZ() - plotRegion.centerZ);
+            layout.put(key, entry.getValue());
+        }
+        return layout;
+    }
+
+    // ===================== Automated farm =====================
+
+    /**
+     * Drives the state machine: when we're the builder, skip our turn with
+     * /hub then /back; when a game ends, requeue with /play. Runs every
+     * tick - operations are gated on automatedNextActionAt so we don't spam.
+     */
+    private void tickAutomated() {
+        long now = System.currentTimeMillis();
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null || client.getNetworkHandler() == null) return;
+
+        // The theme-select chest GUI is the actual blocker on our turn, not a
+        // chat line - poll for it and click the leftmost theme slot the
+        // moment it opens.
+        if (automatedState == AutomatedState.IDLE || automatedState == AutomatedState.IN_GAME
+                || automatedState == AutomatedState.AWAITING_THEME_GUI) {
+            if (tryClickThemeGuiIfOpen(client, now)) {
+                return;
+            }
+        }
+
+        if (now < automatedNextActionAt) return;
+
+        switch (automatedState) {
+            case SKIP_HUB -> {
+                client.getNetworkHandler().sendChatMessage("/hub");
+                automatedState = AutomatedState.SKIP_BACK;
+                automatedNextActionAt = now + 2_500L;
+            }
+            case SKIP_BACK -> {
+                client.getNetworkHandler().sendChatMessage("/back");
+                automatedState = AutomatedState.IN_GAME;
+                automatedNextActionAt = now + 2_000L;
+                awaitingBuilderTurn = false;
+            }
+            case AWAITING_REJOIN -> {
+                client.getNetworkHandler().sendChatMessage("/play build_battle_guess_the_build");
+                automatedState = AutomatedState.IN_GAME;
+                automatedNextActionAt = now + 8_000L;
+            }
+            default -> {
+                // IDLE / IN_GAME / AWAITING_THEME_GUI - nothing to send yet.
+            }
+        }
+    }
+
+    private long lastThemeGuiClickAt;
+
+    /**
+     * If the player's current screen is the GTB theme-select chest, click the
+     * leftmost non-decorative slot, then schedule /hub. Returns true if we
+     * acted, false otherwise (caller skips the rest of the state machine).
+     */
+    private boolean tryClickThemeGuiIfOpen(MinecraftClient client, long now) {
+        if (client.currentScreen == null) return false;
+        if (now - lastThemeGuiClickAt < 1_500L) return false;
+        // Avoid touching anything that isn't a server-driven chest.
+        if (!(client.currentScreen instanceof net.minecraft.client.gui.screen.ingame.HandledScreen<?> hs)) return false;
+        String title = client.currentScreen.getTitle() == null ? "" : client.currentScreen.getTitle().getString().toLowerCase(Locale.ROOT);
+        if (!title.contains("select a theme") && !title.contains("theme to build")) return false;
+
+        net.minecraft.screen.ScreenHandler handler = hs.getScreenHandler();
+        if (handler == null || client.interactionManager == null) return false;
+        // Inventory portion of the slot list is the bottom 36; only iterate the
+        // upper container slots and pick the first one whose stack isn't a
+        // decorative glass pane.
+        int containerSize = Math.max(0, handler.slots.size() - 36);
+        int targetSlot = -1;
+        for (int i = 0; i < containerSize; i++) {
+            net.minecraft.item.ItemStack stack;
+            try {
+                stack = handler.slots.get(i).getStack();
+            } catch (Exception ignored) {
+                continue;
+            }
+            if (stack == null || stack.isEmpty()) continue;
+            String id = net.minecraft.registry.Registries.ITEM.getId(stack.getItem()).getPath();
+            if (id.contains("glass_pane") || id.contains("stained_glass")) continue;
+            targetSlot = i;
+            break;
+        }
+        if (targetSlot < 0) return false;
+
+        client.interactionManager.clickSlot(handler.syncId, targetSlot, 0,
+                net.minecraft.screen.slot.SlotActionType.PICKUP, client.player);
+        lastThemeGuiClickAt = now;
+        automatedState = AutomatedState.SKIP_HUB;
+        automatedNextActionAt = now + 600L;
+        awaitingBuilderTurn = true;
+        return true;
+    }
+
+    /**
+     * Called from chat parsing when the scoreboard / chat indicates we are
+     * the builder for the current round. Schedules the skip-turn flow.
+     */
+    private void triggerSkipTurnIfBuilder() {
+        if (!automatedMode) return;
+        if (automatedState != AutomatedState.IN_GAME && automatedState != AutomatedState.IDLE) return;
+        // We don't /hub yet; the next tick will detect the theme-select chest
+        // GUI and click it before sending /hub. This makes the skip nearly
+        // instant instead of waiting on a fixed delay.
+        automatedState = AutomatedState.AWAITING_THEME_GUI;
+        automatedNextActionAt = 0L;
+        awaitingBuilderTurn = true;
+    }
+
+    /**
+     * Called from chat parsing when "Winners" or game-end signals appear.
+     * Schedules the /play rejoin exactly once per game-end - subsequent
+     * Winners recap lines (Hypixel posts them ~10s apart) are ignored
+     * until a fresh round starts and beginRound() clears awaitingNewGame.
+     */
+    private void triggerRejoinIfAutomated() {
+        if (!automatedMode) return;
+        if (awaitingNewGame) return;
+        long now = System.currentTimeMillis();
+        if (now - lastWinnersSeenAt < 5_000L) return;
+        lastWinnersSeenAt = now;
+        awaitingNewGame = true;
+        automatedState = AutomatedState.AWAITING_REJOIN;
+        automatedNextActionAt = now + 5_000L;
     }
 
     private void clearAutoGuessOnRoundMessage(String message) {
-        String lowerMessage = stripFormatting(message).toLowerCase(Locale.ROOT);
-        if (lowerMessage.contains("_")) {
-            return;
-        }
+        String plain = stripFormatting(message);
+        String lower = plain.toLowerCase(Locale.ROOT);
+        if (lower.contains("_")) return;
+        // Ignore lines that are clearly authored by another player. Without
+        // this, someone typing '+1 point' / 'you guessed' / 'game over' in
+        // chat could lock our auto-guesser for the rest of the round.
+        if (looksLikePlayerChat(plain)) return;
+        boolean pointAwarded = POINT_AWARD.matcher(lower).find();
+        boolean ownCorrect = pointAwarded || lower.contains("you guessed") || lower.contains("you got it")
+                || ownPlayerGuessedCorrectly(lower);
+        boolean roundEnded = ownCorrect || lower.contains("guessed the theme")
+                || lower.contains("the theme was") || lower.contains("round over")
+                || lower.contains("game over") || lower.contains("next round");
+        if (!roundEnded) return;
 
-        if (lowerMessage.contains("you guessed")
-                || lowerMessage.contains("guessed the theme")
-                || lowerMessage.contains("the theme was")
-                || lowerMessage.contains("round over")
-                || lowerMessage.contains("game over")) {
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastPreHintGuess = "";
-            lastPreHintTheme = "";
-            latestPreHintScores.clear();
-            lastChangedBlockCount = 0;
-            lastHint = "";
+        autoGuessQueue.clear();
+        autoGuessIndex = 0;
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
+        hudPlacedCount = 0;
+        lastHint = "";
+        if (ownCorrect) {
+            // Stay quiet for the rest of the round once our guess is accepted.
+            roundGuessLocked = true;
+            hudStatus = "guessed correctly";
         }
     }
 
-    private void scanPreHintGuess(GameContext context) {
-        long now = System.currentTimeMillis();
-        if (now - lastPreHintScanAt < PRE_HINT_SCAN_INTERVAL_MS) {
+    // ===================== Scanner =====================
+
+    private void ensurePlotAnchor(long now) {
+        if (plotRegion != null && now - lastReanchorAt < ROUND_RE_ANCHOR_INTERVAL_MS) return;
+        lastReanchorAt = now;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientPlayerEntity player = client.player;
+        ClientWorld world = client.world;
+        if (player == null || world == null) return;
+
+        // Keep the current anchor if the player is still standing inside the plot
+        // (covers the common case where they walk a few blocks during their build).
+        if (plotRegion != null) {
+            int dx = Math.abs(player.getBlockX() - plotRegion.centerX);
+            int dz = Math.abs(player.getBlockZ() - plotRegion.centerZ);
+            int dy = Math.abs(player.getBlockY() - plotRegion.floorY);
+            if (dx <= PLOT_HALF_SIZE + 4 && dz <= PLOT_HALF_SIZE + 4 && dy <= 18) {
+                return;
+            }
+            // Player teleported / wandered to a new plot — re-anchor below.
+        }
+
+        anchorPlotToPlayer(player, world);
+    }
+
+    private void anchorPlotToPlayer(ClientPlayerEntity player, ClientWorld world) {
+        int px = player.getBlockX();
+        int pz = player.getBlockZ();
+        int py = player.getBlockY();
+
+        // Find the white-terracotta floor: probe a small 5x5 cross under the player
+        // for up to FLOOR_PROBE_DEPTH blocks down. ~150 lookups, runs at most once
+        // per round.
+        int floorY = Integer.MIN_VALUE;
+        outer:
+        for (int dy = 0; dy <= FLOOR_PROBE_DEPTH; dy++) {
+            int y = py - dy;
+            for (int dx = -FLOOR_PROBE_RADIUS; dx <= FLOOR_PROBE_RADIUS; dx++) {
+                for (int dz = -FLOOR_PROBE_RADIUS; dz <= FLOOR_PROBE_RADIUS; dz++) {
+                    BlockState state = world.getBlockState(new BlockPos(px + dx, y, pz + dz));
+                    if (isWhiteTerracotta(state)) {
+                        floorY = y;
+                        break outer;
+                    }
+                }
+            }
+        }
+        if (floorY == Integer.MIN_VALUE) {
+            // Fall back to player.Y - 1 so the scanner still functions even if the
+            // plot floor isn't in render distance yet.
+            floorY = py - 1;
+        }
+
+        plotRegion = new PlotRegion(px, floorY, pz);
+        baseline.clear();
+        placed.clear();
+        captureBaseline(world);
+        hudStatus = "scanner armed";
+    }
+
+    private void captureBaseline(ClientWorld world) {
+        if (plotRegion == null) return;
+        int xMin = plotRegion.centerX - PLOT_HALF_SIZE;
+        int xMax = plotRegion.centerX + PLOT_HALF_SIZE;
+        int zMin = plotRegion.centerZ - PLOT_HALF_SIZE;
+        int zMax = plotRegion.centerZ + PLOT_HALF_SIZE;
+        int yMin = plotRegion.floorY - PLOT_SCAN_BELOW;
+        int yMax = plotRegion.floorY + PLOT_SCAN_ABOVE;
+        // 27 * 27 * 33 = ~24k single-pass world lookups, executed once per round.
+        for (BlockPos pos : BlockPos.iterate(xMin, yMin, zMin, xMax, yMax, zMax)) {
+            BlockState state = world.getBlockState(pos);
+            String id = Registries.BLOCK.getId(state.getBlock()).getPath();
+            baseline.put(pos.asLong(), id);
+        }
+    }
+
+    private void runScannerScan() {
+        hudPlacedCount = placed.size();
+        if (plotRegion == null) {
+            hudStatus = "scanner: no plot";
             return;
         }
-        lastPreHintScanAt = now;
-
-        if (roundBaselineBlocks.isEmpty() && context.plotAnchor().isValid()) {
-            captureRoundBaseline(context.plotAnchor());
-            lastHudStatus = "locking baseline";
-            lastChangedBlockCount = 0;
+        if (placed.size() < MIN_SCAN_BLOCKS) {
+            lastScannerScores = List.of();
+            hudStatus = "scanner: waiting";
             return;
         }
 
-        Optional<BlockScan> scan = buildTrackedScan(context.plotAnchor());
-        if (scan.isEmpty()) {
-            latestPreHintScores.clear();
-            lastChangedBlockCount = 0;
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastHudStatus = trackedPlotBlocks.isEmpty() ? "waiting for placed blocks" : "no tracked scan";
-            return;
+        BuildFingerprint fp = BuildFingerprint.fromPlaced(placed, plotRegion);
+        // Augment with the builder's held block as a soft hint — useful when the
+        // builder is reaching for a new block before placing it.
+        String builderHeldToken = readBuilderHeldBlockToken();
+        if (builderHeldToken != null) fp.addExtraToken(builderHeldToken);
+
+        List<ScoredTheme> scored = scoreThemes(fp);
+        if (scored.isEmpty()) {
+            // Don't go silent — fall back to the top common priors so the bot
+            // can still keep guessing while the build is too ambiguous to score.
+            scored = fallbackScanGuesses(fp);
         }
+        lastScannerScores = scored;
 
-        BlockScan blockScan = scan.get();
-        if (blockScan.totalBlocks > PRE_HINT_MAX_CHANGED_BLOCKS) {
-            latestPreHintScores.clear();
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastChangedBlockCount = 0;
-            lastHudStatus = "scan rejected";
-            return;
-        }
-
-        lastChangedBlockCount = blockScan.totalBlocks;
-        latestPreHintScores.clear();
-
-        List<ScoredTheme> scores = themeWords.stream()
-                .map(theme -> new ScoredTheme(theme, scoreThemeAgainstBlocks(theme, blockScan)))
-                .filter(scoredTheme -> scoredTheme.score() >= PRE_HINT_MIN_SCORE)
-                .sorted(Comparator.comparingDouble(ScoredTheme::score).reversed())
-                .limit(32)
-                .toList();
-
-        for (ScoredTheme score : scores) {
-            latestPreHintScores.put(score.theme().toLowerCase(Locale.ROOT), score.score());
-        }
-
-        if (scores.isEmpty()) {
-            autoGuessQueue.clear();
-            autoGuessIndex = 0;
-            lastHudStatus = "no prehint match";
+        if (scored.isEmpty()) {
+            hudStatus = "scanner: no match";
             return;
         }
 
         if (lastHint.isBlank()) {
-            updateAutoGuessQueue(scores.stream()
-                    .map(ScoredTheme::theme)
-                    .limit(8)
-                    .collect(Collectors.toList()));
+            // No hint yet — feed the auto-guess queue with our top scanner candidates.
+            List<String> queue = new ArrayList<>();
+            for (int i = 0; i < Math.min(scored.size(), 6); i++) {
+                queue.add(scored.get(i).theme());
+            }
+            updateAutoGuessQueue(queue);
         }
 
-        ScoredTheme best = scores.getFirst();
-        double secondScore = scores.size() > 1 ? scores.get(1).score() : 0.0;
-        if (best.score() - secondScore < PRE_HINT_MIN_LEAD) {
-            lastHudStatus = "prehint ambiguous";
+        ScoredTheme best = scored.get(0);
+        double secondScore = scored.size() > 1 ? scored.get(1).score() : 0.0;
+        // Bypass the lead threshold for tiny single-block-dominant builds — if
+        // someone places a cake / crafting table / furnace, the dominant block
+        // alone identifies the theme and the bot should commit to it.
+        boolean singleBlockDominant = fp.totalBlocks() <= 6 && fp.dominantBlockId() != null
+                && !GTBBlockSignatures.singleBlockThemes(fp.dominantBlockId()).isEmpty();
+        if (!singleBlockDominant && best.score() - secondScore < SCAN_LEAD_THRESHOLD) {
+            hudStatus = "scanner: " + scored.size() + " candidates";
             return;
         }
 
         String shortestGuess = getShortestTranslation(best.theme());
-        if (!shortestGuess.equalsIgnoreCase(lastPreHintGuess)) {
-            lastPreHintGuess = shortestGuess;
-            lastPreHintTheme = best.theme();
-            lastHudStatus = "prehint " + shortestGuess;
-            sendPreHintSuggestion(best.theme());
-        }
-    }
-
-    private Optional<BlockScan> buildTrackedScan(PlotAnchor anchor) {
-        if (!anchor.isValid() || trackedPlotBlocks.isEmpty()) {
-            return Optional.empty();
-        }
-
-        BlockPos center = anchor.center();
-        BlockScan scan = new BlockScan(center);
-        for (Map.Entry<Long, String> entry : trackedPlotBlocks.entrySet()) {
-            BlockPos pos = BlockPos.fromLong(entry.getKey());
-            if (!isWithinTrackedPlot(pos, anchor)) {
-                continue;
+        if (!shortestGuess.equalsIgnoreCase(lastScannerGuess)) {
+            lastScannerGuess = shortestGuess;
+            lastScannerTheme = best.theme();
+            hudStatus = "scanner: " + shortestGuess;
+            long now = System.currentTimeMillis();
+            if (now - lastScannerNoticeAt >= SCANNER_NOTICE_INTERVAL_MS) {
+                lastScannerNoticeAt = now;
+                sendScannerSuggestion(best.theme());
             }
-            scan.add(pos, entry.getValue());
         }
-
-        return scan.totalBlocks >= PRE_HINT_MIN_BLOCKS ? Optional.of(scan) : Optional.empty();
     }
 
-    private double scoreThemeAgainstBlocks(String theme, BlockScan scan) {
-        String normalizedTheme = normalizeTheme(theme);
-        Set<String> themeTokens = new HashSet<>(List.of(normalizedTheme.split(" ")));
+    private List<ScoredTheme> scoreThemes(BuildFingerprint fp) {
+        // Candidate pool — themes whose name overlaps with build tokens, OR have
+        // a curated profile, OR are flagged by a single-block hint, OR are
+        // common priors, OR have historically used at least one of these
+        // tokens (learning-store reverse index).
+        //
+        // We score EVERY theme in the dictionary - the candidate-pool
+        // pre-filter from previous versions was capping the bot at niche
+        // themes its heuristics had never seen, so 'Diamond Ring' or
+        // 'Ice Skates' could never appear in the result no matter how
+        // strongly the build matched. Scoring all ~1700 themes is fast
+        // enough (constant-time per theme) and the score floor filters
+        // out non-matches.
+        List<ScoredTheme> scored = new ArrayList<>(themeWords.size());
+        for (String original : themeWords) {
+            double score = scoreTheme(original, fp);
+            if (score >= MIN_SCAN_SCORE) scored.add(new ScoredTheme(original, score));
+        }
+        scored.sort(Comparator.comparingDouble(ScoredTheme::score).reversed());
+        return scored;
+    }
+
+    private double scoreTheme(String theme, BuildFingerprint fp) {
+        String key = theme.toLowerCase(Locale.ROOT);
+        Set<String> themeTokens = themeTokenIndex.getOrDefault(key, themeNameTokens(theme));
+
         double score = 0.0;
 
+        // 1) Direct token overlap (theme word literally appears in placed-block tokens)
         for (String token : themeTokens) {
-            if (token.isBlank()) {
-                continue;
-            }
-            score += scan.count(token) * 1.35;
-            if (COLOR_WORDS.contains(token)) {
-                score += scan.count(token) * 0.45;
-            }
-            if (LEGACY_BLOCK_KEYWORDS.contains(token)) {
-                score += scan.count(token) * 1.1;
+            int count = fp.tokenCount(token);
+            if (count > 0) {
+                score += Math.min(count, 25) * 1.4;
+                if (GTBBlockSignatures.isColorToken(token)) {
+                    score += Math.min(count, 25) * 0.4;
+                }
             }
         }
 
-        score += frequencyBias(theme);
-        score += genericComplexityScore(theme, scan);
-        score += shapeScore(theme, scan);
-        score += categoryScore(normalizedTheme, scan);
-        score += directSemanticScore(normalizedTheme, scan);
-        return score;
-    }
-
-    private double genericComplexityScore(String theme, BlockScan scan) {
-        String normalizedTheme = normalizeTheme(theme);
-        boolean simpleWord = !normalizedTheme.contains(" ") && normalizedTheme.length() <= 5;
-        boolean complexWord = normalizedTheme.contains(" ") || normalizedTheme.length() >= 10;
-
-        double score = 0.0;
-        if (scan.totalBlocks <= 4 && simpleWord) {
-            score += 4.0;
+        // 2) Single-block signatures: any placed block ID that flags this exact theme
+        int sigHits = fp.singleBlockThemeHitCount(key);
+        if (sigHits > 0) {
+            score += Math.min(sigHits, 8) * 6.0;
         }
-        if (scan.totalBlocks >= 25 && complexWord) {
-            score += 3.0;
+
+        // 3) Curated theme profile
+        GTBThemeProfiles.Profile profile = GTBThemeProfiles.lookup(theme);
+        if (profile != null) {
+            score += scoreProfile(profile, fp);
         }
-        return score;
-    }
 
-    private double shapeScore(String theme, BlockScan scan) {
-        String normalizedTheme = normalizeTheme(theme);
-        double score = 0.0;
+        // 4) Frequency / common-theme priors
+        score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0);
+        score += PandoraConfig.getInstance().getThemeFrequency(theme) * 0.5;
 
-        if (scan.symmetryX() > 0.72 || scan.symmetryZ() > 0.72) {
-            if (containsAny(normalizedTheme, "airplane", "butterfly", "glasses", "bow", "wings")) {
-                score += 6.0;
+        // 4b) Learned token affinity: how often this theme used these blocks in
+        // past rounds. Themes that have seen the same tokens before get a boost
+        // proportional to the overlap.
+        GTBLearningStore learning = GTBLearningStore.getInstance();
+        double affinityBonus = 0.0;
+        for (String token : fp.tokens()) {
+            double affinity = learning.tokenAffinity(theme, token);
+            if (affinity > 0.0) {
+                affinityBonus += affinity * Math.min(fp.tokenCount(token), 20) * 0.8;
+            }
+        }
+        // Lightly downweight the bonus until we've seen the theme a few times
+        // so a single fluke round doesn't dominate.
+        int rounds = learning.roundsObserved(theme);
+        if (rounds > 0) {
+            score += affinityBonus * Math.min(1.0, rounds / 3.0);
+        }
+
+        // 5) Single-block dominance bonus: tiny build of one signature block
+        if (fp.totalBlocks() <= 6 && fp.dominantBlockId() != null) {
+            for (String hint : GTBBlockSignatures.singleBlockThemes(fp.dominantBlockId())) {
+                if (key.equalsIgnoreCase(hint)) {
+                    score += SINGLE_BLOCK_LEAD_BONUS;
+                    break;
+                }
             }
         }
 
-        if (scan.isTall()) {
-            if (containsAny(normalizedTheme, "tree", "treehouse", "rocket", "tower", "cactus", "skyscraper")) {
-                score += 5.0;
+        // 6) Hint-pattern compatibility filter — strict
+        if (!lastHint.isBlank() && !hintMatchesTheme(lastHint, theme)) {
+            score *= 0.05;
+        }
+
+        // 7) Penalise single-word themes whose entire name is a generic color
+        // or material. Without this, placing a stack of green blocks would
+        // surface 'Green' / 'Green Wool' as a top guess, beating themes like
+        // 'Christmas Tree' / 'Apple' / 'Lime' that actually use green blocks.
+        // Variety bonus: themes whose name has multiple tokens AND multiple of
+        // those tokens appear in the build (e.g. 'Diamond Ring' with diamond
+        // AND a ring-shaped profile match) are upweighted.
+        if (themeTokens.size() == 1) {
+            String only = themeTokens.iterator().next();
+            if (GENERIC_TOKEN_NAMES.contains(only)) {
+                score *= 0.25;
             }
-        }
-
-        if (scan.isFlat() && scan.isSquareish()) {
-            if (containsAny(normalizedTheme, "pizza", "coin", "clock", "sun", "ball", "button", "plate")) {
-                score += 5.0;
+        } else if (themeTokens.size() >= 2) {
+            int matched = 0;
+            for (String token : themeTokens) {
+                if (fp.tokenCount(token) > 0) matched++;
             }
-        }
-
-        if (scan.isWide()) {
-            if (containsAny(normalizedTheme, "bridge", "airplane", "train", "traffic light")) {
-                score += 3.0;
-            }
-        }
-
-        return score;
-    }
-
-    private double categoryScore(String theme, BlockScan scan) {
-        double score = 0.0;
-
-        if ((theme.contains("traffic") && theme.contains("light")) || theme.contains("signal")) {
-            score += triColorScore(scan, "red", "yellow", "green") * 1.8;
-            score += capped(scan.count("wool") + scan.count("terracotta") + scan.count("clay") + scan.count("glass"), 20) * 0.4;
-        }
-
-        if (containsAny(theme, "swim", "pool", "ocean", "sea", "water")) {
-            score += capped(scan.count("water"), 80) * 0.35;
-            score += capped(scan.count("blue") + scan.count("cyan") + scan.count("prismarine") + scan.count("sand"), 40) * 0.2;
-        }
-
-        if (containsAny(theme, "fire", "lava", "volcano", "nether")) {
-            score += capped(scan.count("lava") + scan.count("fire") + scan.count("netherrack"), 40) * 0.45;
-            score += capped(scan.count("red") + scan.count("orange") + scan.count("yellow") + scan.count("glowstone"), 60) * 0.18;
-        }
-
-        if (containsAny(theme, "snow", "ice", "winter", "frozen")) {
-            score += capped(scan.count("snow") + scan.count("ice") + scan.count("packed"), 60) * 0.35;
-            score += capped(scan.count("white") + scan.count("blue"), 40) * 0.15;
-        }
-
-        if (containsAny(theme, "treehouse")) {
-            score += capped(scan.count("log") + scan.count("planks") + scan.count("wood"), 70) * 0.28;
-            score += capped(scan.count("leaves") + scan.count("green") + scan.count("fence"), 50) * 0.08;
-        } else if (containsAny(theme, "tree", "forest", "jungle", "plant", "garden")) {
-            score += capped(scan.count("log") + scan.count("leaves") + scan.count("sapling"), 60) * 0.3;
-            score += capped(scan.count("green") + scan.count("grass") + scan.count("dirt"), 50) * 0.18;
-        }
-
-        if (containsAny(theme, "house", "home", "hut", "cabin")) {
-            score += capped(scan.count("planks") + scan.count("wood") + scan.count("log") + scan.count("brick"), 60) * 0.2;
-            score += capped(scan.count("glass") + scan.count("door") + scan.count("stairs") + scan.count("fence"), 40) * 0.18;
-        }
-
-        if (containsAny(theme, "beach", "desert", "sand")) {
-            score += capped(scan.count("sand") + scan.count("sandstone"), 80) * 0.28;
-            score += capped(scan.count("water") + scan.count("cactus"), 40) * 0.14;
-        }
-
-        if (containsAny(theme, "fries", "fry", "chips", "potato")) {
-            score += capped(scan.count("yellow") + scan.count("orange"), 60) * 0.3;
-            score += capped(scan.count("wool") + scan.count("terracotta") + scan.count("glass"), 40) * 0.16;
-        }
-
-        if (containsAny(theme, "pizza", "burger", "hotdog", "taco", "sandwich")) {
-            score += capped(scan.count("red") + scan.count("orange") + scan.count("yellow") + scan.count("brown"), 70) * 0.24;
-            score += capped(scan.count("wool") + scan.count("terracotta") + scan.count("clay"), 40) * 0.15;
-        }
-
-        if (containsAny(theme, "juice", "drink", "soda", "smoothie", "milkshake", "cocktail")) {
-            score += capped(scan.count("glass") + scan.count("pane") + scan.count("water"), 60) * 0.26;
-            score += capped(scan.count("orange") + scan.count("yellow") + scan.count("red") + scan.count("lime"), 50) * 0.16;
-        }
-
-        if (containsAny(theme, "cloud", "smoke")) {
-            score += capped(scan.count("white") + scan.count("snow") + scan.count("glass") + scan.count("wool"), 60) * 0.25;
-        }
-
-        if (containsAny(theme, "calculator", "computer", "keyboard", "phone", "remote")) {
-            score += capped(scan.count("gray") + scan.count("grey") + scan.count("black") + scan.count("stone") + scan.count("button"), 80) * 0.24;
-            score += capped(scan.count("glass") + scan.count("quartz") + scan.count("iron"), 40) * 0.12;
+            if (matched >= 2) score *= 1.5;
         }
 
         return score;
     }
 
-    private double directSemanticScore(String theme, BlockScan scan) {
+    /** Single-word generic colour / material names that should rarely win the scanner. */
+    private static final Set<String> GENERIC_TOKEN_NAMES = Set.of(
+            "white", "orange", "magenta", "yellow", "lime", "pink", "gray", "grey", "silver",
+            "cyan", "purple", "blue", "brown", "green", "red", "black",
+            "gold", "iron", "diamond", "emerald", "stone", "wood", "wool", "glass",
+            "dirt", "sand", "water", "ice", "snow", "obsidian", "redstone", "lapis"
+    );
+
+    private double scoreProfile(GTBThemeProfiles.Profile profile, BuildFingerprint fp) {
         double score = 0.0;
 
-        if (theme.equals("crafting table")) {
-            score += capped(scan.count("crafting_table") * 5 + scan.count("crafting") * 3 + scan.count("table") * 2, 30);
+        if (profile.signatureBlock() != null) {
+            int count = fp.blockIdCount(profile.signatureBlock());
+            if (count > 0) {
+                score += 18.0;
+                if (fp.totalBlocks() <= 6) score += 10.0;
+                if (count == fp.totalBlocks()) score += 6.0;
+            }
         }
-        if (theme.equals("calculator")) {
-            score += capped(scan.count("button") + scan.count("stone") + scan.count("gray") + scan.count("black"), 30) * 0.7;
+        for (String color : profile.colors()) {
+            int count = fp.tokenCount(color);
+            if (count > 0) {
+                double frac = count / (double) Math.max(1, fp.totalBlocks());
+                score += 3.0 + frac * 6.0;
+            }
         }
-        if (theme.equals("cloud")) {
-            score += capped(scan.count("white") + scan.count("glass") + scan.count("snow"), 30) * 0.55;
+        if (!profile.colors().isEmpty()) {
+            String dominant = fp.dominantColor();
+            if (dominant != null && profile.colors().contains(dominant)) score += 5.0;
         }
-
+        for (String material : profile.materials()) {
+            int count = fp.tokenCount(material);
+            if (count > 0) score += 2.0 + Math.min(count, 20) * 0.25;
+        }
+        for (GTBThemeProfiles.Shape shape : profile.shapes()) {
+            if (matchesShape(shape, fp)) score += 4.0;
+        }
+        if (profile.minBlocks() > 0 && fp.totalBlocks() < profile.minBlocks()) {
+            score *= 0.6;
+        }
+        if (profile.maxBlocks() > 0 && fp.totalBlocks() > profile.maxBlocks()) {
+            score *= 0.4;
+        }
         return score;
     }
 
-    private void sendPreHintSuggestion(String englishWord) {
+    private static boolean matchesShape(GTBThemeProfiles.Shape shape, BuildFingerprint fp) {
+        return switch (shape) {
+            case FLAT -> fp.isFlat();
+            case FLAT_ROUND -> fp.isFlat() && fp.isRoundish();
+            case TALL -> fp.isTall();
+            case TALL_NARROW -> fp.isTall() && fp.maxFootprint() <= 5;
+            case WIDE -> fp.isWide();
+            case SYMMETRIC -> fp.symmetryX() > 0.65 || fp.symmetryZ() > 0.65;
+            case BIG -> fp.totalBlocks() >= 60;
+        };
+    }
+
+    private boolean hintMatchesTheme(String hint, String theme) {
+        if (hint.length() != theme.length()) return false;
+        long hintSpaces = hint.chars().filter(c -> c == ' ').count();
+        long themeSpaces = theme.chars().filter(c -> c == ' ').count();
+        if (hintSpaces != themeSpaces) return false;
+        String lowerTheme = theme.toLowerCase(Locale.ROOT);
+        for (int i = 0; i < hint.length(); i++) {
+            char h = hint.charAt(i);
+            if (h == '_' || h == ' ') continue;
+            if (lowerTheme.charAt(i) != h) return false;
+        }
+        return true;
+    }
+
+    private void sendScannerSuggestion(String englishWord) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null) {
-            return;
-        }
-
+        if (client.player == null) return;
         client.player.sendMessage(prefix()
-                .append(Text.literal("GTB pre-hint guess: ").formatted(Formatting.GREEN))
+                .append(Text.literal("scanner: ").formatted(Formatting.GREEN))
                 .append(createCopyableAnswer(englishWord, Formatting.YELLOW)), false);
     }
 
     private Text createSuggestionEntry(String englishWord) {
         String shortestTranslation = getShortestTranslation(englishWord);
-
         MutableText entry = Text.literal(" > ").formatted(Formatting.DARK_GRAY)
                 .append(createCopyableAnswer(englishWord, Formatting.YELLOW));
-
         if (!shortestTranslation.equalsIgnoreCase(englishWord)) {
             entry.append(Text.literal(" (" + shortestTranslation + ")").formatted(Formatting.GRAY));
         }
-
         return entry;
     }
 
     private MutableText createCopyableAnswer(String englishWord, Formatting color) {
         String shortestTranslation = getShortestTranslation(englishWord);
         MutableText answer = Text.literal(englishWord.toLowerCase(Locale.ROOT)).formatted(color);
-
         return answer.setStyle(answer.getStyle()
                 .withClickEvent(new ClickEvent.CopyToClipboard(shortestTranslation))
                 .withHoverEvent(new HoverEvent.ShowText(Text.literal("Click to copy: " + shortestTranslation).formatted(Formatting.GRAY))));
@@ -1020,11 +1459,11 @@ public class GTBSolverEngine {
         return Text.literal("[Pandora] ").formatted(Formatting.LIGHT_PURPLE);
     }
 
+    // ===================== Game context (scoreboard + chat) =====================
+
     private GameContext readGameContext() {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.world == null || client.player == null) {
-            return GameContext.inactive();
-        }
+        if (client.world == null || client.player == null) return GameContext.inactive();
 
         Scoreboard scoreboard = client.world.getScoreboard();
         ScoreboardObjective sidebar = scoreboard.getObjectiveForSlot(ScoreboardDisplaySlot.SIDEBAR);
@@ -1044,8 +1483,15 @@ public class GTBSolverEngine {
         boolean recentBuilder = now - lastBuilderSignalAt < ROUND_SIGNAL_GRACE_MS;
         boolean recentHint = now - lastHintSignalAt < ROUND_SIGNAL_GRACE_MS;
 
-        boolean scoreboardGtb = title.contains("guess the build") || lines.stream().anyMatch(line -> line.contains("guess the build"));
-        boolean inGuessTheBuild = scoreboardGtb || ((recentRound || recentHint) && recentBuilder);
+        // Pre-game lobby detection: server may animate the title with per-character
+        // colors (yellow→orange→white) which strip cleanly to plain text. Also
+        // accept "Mode: Guess The Build" sidebar lines from the main hub, the
+        // bare "GTB" abbreviation, and any line containing both "build" + "guess".
+        boolean scoreboardGtb = mentionsGtb(title)
+                || lines.stream().anyMatch(GTBSolverEngine::mentionsGtb);
+        boolean inGuessTheBuild = scoreboardGtb || ((recentRound || recentHint) && recentBuilder)
+                || (recentRound && recentHint)
+                || com.garous.pandora.net.HypixelApiClient.getInstance().isInGuessTheBuild();
 
         String builderLine = findLine(lines, "builder");
         String timeLine = findLine(lines, "time");
@@ -1056,136 +1502,21 @@ public class GTBSolverEngine {
         boolean hasBuilderSignal = builderLine != null || recentBuilder;
         boolean hasRoundSignal = roundLine != null || recentRound;
         boolean hasTimeSignal = timeLine != null;
-        boolean activeRound = inGuessTheBuild && ((hasBuilderSignal && hasRoundSignal) || (hasBuilderSignal && hasTimeSignal) || recentHint);
-        boolean allowPreHint = activeRound && (themeLine == null || themeLine.contains("???")) && lastHint.isBlank();
+        boolean activeRound = inGuessTheBuild && ((hasBuilderSignal && hasRoundSignal)
+                || (hasBuilderSignal && hasTimeSignal) || recentHint || recentRound);
         boolean revealedThemeVisible = !visibleTheme.isBlank() && !visibleTheme.contains("?") && !visibleTheme.contains("_");
 
+        // Round key excludes the theme line on purpose - the theme line changes
+        // every time another letter is revealed, and including it caused
+        // beginRound() to wipe scanner state mid-round (which then re-emitted
+        // the same hint suggestions repeatedly).
         String roundKey = activeRound
                 ? String.join("|",
                 roundLine != null ? roundLine : lastRoundLabel,
-                builderLine != null ? builderLine : lastBuilderLabel,
-                themeLine != null ? themeLine : lastThemeLabel)
+                builderLine != null ? builderLine : lastBuilderLabel)
                 : "";
 
-        PlotAnchor plotAnchor = lastPlotAnchor;
-        if (activeRound && (!plotAnchor.isValid() || now - lastPlotSearchAt >= PLOT_SEARCH_INTERVAL_MS)) {
-            plotAnchor = detectPlotAnchor(client).orElse(lastPlotAnchor);
-            if (plotAnchor.isValid()) {
-                lastPlotAnchor = plotAnchor;
-            }
-        }
-
-        return new GameContext(
-                inGuessTheBuild,
-                activeRound,
-                allowPreHint,
-                roundKey,
-                plotAnchor,
-                revealedThemeVisible
-        );
-    }
-
-    private Optional<PlotAnchor> detectPlotAnchor(MinecraftClient client) {
-        if (client == null || client.world == null || client.player == null) {
-            return Optional.empty();
-        }
-
-        long now = System.currentTimeMillis();
-        if (lastPlotAnchor.isValid() && now - lastPlotSearchAt < PLOT_SEARCH_INTERVAL_MS) {
-            return Optional.of(lastPlotAnchor);
-        }
-        lastPlotSearchAt = now;
-
-        List<BlockPos> searchOrigins = new ArrayList<>();
-        BlockPos playerPos = client.player.getBlockPos();
-        searchOrigins.add(playerPos);
-
-        Vec3d look = client.player.getRotationVecClient();
-        Vec3d horizontal = new Vec3d(look.x, 0.0, look.z);
-        if (horizontal.lengthSquared() > 1.0E-4) {
-            Vec3d ahead = horizontal.normalize().multiply(22.0);
-            searchOrigins.add(BlockPos.ofFloored(client.player.getX() + ahead.x, client.player.getY(), client.player.getZ() + ahead.z));
-        }
-
-        PlotAnchor best = null;
-        for (BlockPos origin : searchOrigins) {
-            Optional<PlotAnchor> candidate = detectPlotAnchorAround(client, origin);
-            if (candidate.isEmpty()) {
-                continue;
-            }
-            if (best == null || candidate.get().confidence() > best.confidence()) {
-                best = candidate.get();
-            }
-        }
-
-        if (best == null) {
-            return Optional.ofNullable(lastPlotAnchor.isValid() ? lastPlotAnchor : null);
-        }
-
-        lastPlotAnchor = best;
-        return Optional.of(best);
-    }
-
-    private Optional<PlotAnchor> detectPlotAnchorAround(MinecraftClient client, BlockPos origin) {
-        int bestY = Integer.MIN_VALUE;
-        int bestCount = 0;
-        for (int y = origin.getY() - PLOT_SEARCH_VERTICAL; y <= origin.getY() + PLOT_SEARCH_VERTICAL; y++) {
-            int count = 0;
-            for (int x = origin.getX() - PLOT_SEARCH_RADIUS; x <= origin.getX() + PLOT_SEARCH_RADIUS; x++) {
-                for (int z = origin.getZ() - PLOT_SEARCH_RADIUS; z <= origin.getZ() + PLOT_SEARCH_RADIUS; z++) {
-                    if (isWhiteTerracotta(client.world.getBlockState(new BlockPos(x, y, z)))) {
-                        count++;
-                    }
-                }
-            }
-            if (count > bestCount) {
-                bestCount = count;
-                bestY = y;
-            }
-        }
-
-        if (bestCount < MIN_WHITE_TERRACOTTA_FLOOR_BLOCKS) {
-            return Optional.empty();
-        }
-
-        int minX = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE;
-        int minZ = Integer.MAX_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        int totalX = 0;
-        int totalZ = 0;
-        int totalBlocks = 0;
-        for (int x = origin.getX() - PLOT_SEARCH_RADIUS; x <= origin.getX() + PLOT_SEARCH_RADIUS; x++) {
-            for (int z = origin.getZ() - PLOT_SEARCH_RADIUS; z <= origin.getZ() + PLOT_SEARCH_RADIUS; z++) {
-                if (!isWhiteTerracotta(client.world.getBlockState(new BlockPos(x, bestY, z)))) {
-                    continue;
-                }
-                minX = Math.min(minX, x);
-                maxX = Math.max(maxX, x);
-                minZ = Math.min(minZ, z);
-                maxZ = Math.max(maxZ, z);
-                totalX += x;
-                totalZ += z;
-                totalBlocks++;
-            }
-        }
-
-        if (totalBlocks < MIN_WHITE_TERRACOTTA_FLOOR_BLOCKS) {
-            return Optional.empty();
-        }
-
-        int spanX = maxX - minX;
-        int spanZ = maxZ - minZ;
-        if (totalBlocks > MAX_WHITE_TERRACOTTA_FLOOR_BLOCKS || spanX > MAX_PLOT_SPAN || spanZ > MAX_PLOT_SPAN) {
-            return Optional.empty();
-        }
-        int centerX = spanX >= PLOT_HALF_SIZE ? Math.round((minX + maxX) / 2.0f) : Math.round(totalX / (float) totalBlocks);
-        int centerZ = spanZ >= PLOT_HALF_SIZE ? Math.round((minZ + maxZ) / 2.0f) : Math.round(totalZ / (float) totalBlocks);
-        double confidence = 900.0
-                - Math.abs(totalBlocks - 729)
-                - Math.abs(spanX - PLOT_HALF_SIZE * 2) * 8.0
-                - Math.abs(spanZ - PLOT_HALF_SIZE * 2) * 8.0;
-        return Optional.of(new PlotAnchor(new BlockPos(centerX, bestY, centerZ), bestY, confidence));
+        return new GameContext(inGuessTheBuild, activeRound, roundKey, revealedThemeVisible);
     }
 
     private String scoreboardLine(ScoreboardEntry entry) {
@@ -1195,12 +1526,10 @@ public class GTBSolverEngine {
     }
 
     private String findLine(List<String> lines, String prefix) {
-        String loweredPrefix = prefix.toLowerCase(Locale.ROOT);
+        String lp = prefix.toLowerCase(Locale.ROOT);
         for (String line : lines) {
             String compact = line.replace(" ", "");
-            if (compact.startsWith(loweredPrefix + ":")) {
-                return line;
-            }
+            if (compact.startsWith(lp + ":")) return line;
         }
         return null;
     }
@@ -1209,121 +1538,131 @@ public class GTBSolverEngine {
         activeRoundKey = context.roundKey();
         lastHint = "";
         lastResults = new ArrayList<>();
-        lastPreHintGuess = "";
-        lastPreHintTheme = "";
-        latestPreHintScores.clear();
-        pendingPlotUpdates.clear();
-        trackedPlotBlocks.clear();
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
         autoGuessQueue.clear();
-        guessHistory.clear();
         autoGuessIndex = 0;
         lastAutoGuessAt = 0L;
-        captureRoundBaseline(context.plotAnchor());
-    }
-
-    private void captureRoundBaseline(PlotAnchor anchor) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.world == null || !anchor.isValid()) {
-            roundBaselineBlocks = new HashMap<>();
-            return;
-        }
-
-        BlockPos center = anchor.center();
-        Map<Long, String> baseline = new HashMap<>();
-        int minX = center.getX() - PLOT_HALF_SIZE;
-        int maxX = center.getX() + PLOT_HALF_SIZE;
-        int minY = anchor.floorY() + PLOT_SCAN_MIN_Y;
-        int maxY = anchor.floorY() + PLOT_SCAN_MAX_Y;
-        int minZ = center.getZ() - PLOT_HALF_SIZE;
-        int maxZ = center.getZ() + PLOT_HALF_SIZE;
-
-        for (BlockPos pos : BlockPos.iterate(minX, minY, minZ, maxX, maxY, maxZ)) {
-            BlockState state = client.world.getBlockState(pos);
-            baseline.put(pos.asLong(), Registries.BLOCK.getId(state.getBlock()).getPath());
-        }
-
-        roundBaselineBlocks = baseline;
-        reconcilePendingPlotUpdates();
-    }
-
-    private void reconcilePendingPlotUpdates() {
-        if (roundBaselineBlocks.isEmpty() || pendingPlotUpdates.isEmpty()) {
-            return;
-        }
-
-        for (Map.Entry<Long, String> entry : pendingPlotUpdates.entrySet()) {
-            long packedPos = entry.getKey();
-            String blockId = entry.getValue();
-            String baseline = roundBaselineBlocks.get(packedPos);
-            if (blockId.isBlank()
-                    || baseline == null
-                    || blockId.equals(baseline)
-                    || isIgnoredBuildBlock(blockId)) {
-                trackedPlotBlocks.remove(packedPos);
-            } else {
-                trackedPlotBlocks.put(packedPos, blockId);
-            }
-        }
-
-        pendingPlotUpdates.clear();
+        lastSentGuess = "";
+        roundGuessLocked = false;
+        // We're in a new round, so a future game-end can trigger /play once more.
+        awaitingNewGame = false;
+        // Re-anchor the plot at next opportunity for the new round.
+        plotRegion = null;
+        baseline.clear();
+        placed.clear();
+        hudPlacedCount = 0;
     }
 
     private void clearAutomationState() {
         autoGuessQueue.clear();
         autoGuessIndex = 0;
         guessHistory.clear();
-        latestPreHintScores.clear();
-        trackedPlotBlocks.clear();
-        lastPreHintGuess = "";
-        lastPreHintTheme = "";
+        plotRegion = null;
+        baseline.clear();
+        placed.clear();
+        lastScannerGuess = "";
+        lastScannerTheme = "";
+        lastScannerScores = List.of();
         activeRoundKey = "";
-        lastHudStatus = "waiting for GTB round";
-        lastChangedBlockCount = 0;
-        roundBaselineBlocks = new HashMap<>();
-        pendingPlotUpdates.clear();
+        hudStatus = "waiting for GTB round";
+        hudPlacedCount = 0;
         lastAutoGuessAt = 0L;
     }
 
-    public String getShortestTranslation(String englishWord) {
-        return shortestTranslationMap.getOrDefault(englishWord.toLowerCase(Locale.ROOT), englishWord);
-    }
-
-    public List<String> getThemeWords() {
-        return Collections.unmodifiableList(themeWords);
-    }
+    // ===================== Helpers =====================
 
     private String extractValueAfterColon(String message, String prefix) {
-        String loweredMessage = message.toLowerCase(Locale.ROOT);
-        String loweredPrefix = prefix.toLowerCase(Locale.ROOT) + ":";
-        int start = loweredMessage.indexOf(loweredPrefix);
-        if (start < 0) {
-            return "";
+        String lm = message.toLowerCase(Locale.ROOT);
+        String lp = prefix.toLowerCase(Locale.ROOT) + ":";
+        int start = lm.indexOf(lp);
+        if (start < 0) return "";
+        return clean(message.substring(start + lp.length()));
+    }
+
+    private boolean ownPlayerGuessedCorrectly(String lower) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return false;
+        String name = client.player.getName().getString().toLowerCase(Locale.ROOT);
+        if (name.isEmpty()) return false;
+        // "<name> guessed it" / "<name> guessed the theme" addressed to our player.
+        return (lower.contains("guessed") && lower.contains(name))
+                && (lower.contains("guessed it") || lower.contains("guessed the"));
+    }
+
+    private static boolean mentionsGtb(String text) {
+        if (text == null || text.isEmpty()) return false;
+        if (text.contains("guess the build")) return true;
+        // "GTB" as a standalone token (lowercased earlier so check 'gtb').
+        if (text.matches(".*\\bgtb\\b.*")) return true;
+        // "Mode: Guess..." or "Map: Guess..." style lines that name the game.
+        return text.contains("guess") && text.contains("build");
+    }
+
+    /**
+     * Reads the builder's main-hand item if it's a block. Returns the block id
+     * path (e.g. "gold_block") or null if no builder/block could be found.
+     */
+    private String readBuilderHeldBlockToken() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null || client.player == null || plotRegion == null) return null;
+        String ownName = client.player.getName().getString();
+        String builderName = lastBuilderLabel == null ? "" : lastBuilderLabel.trim();
+        net.minecraft.entity.player.PlayerEntity builder = null;
+        for (net.minecraft.entity.player.PlayerEntity p : client.world.getPlayers()) {
+            if (p == client.player) continue;
+            if (p.getName().getString().equalsIgnoreCase(ownName)) continue;
+            // Prefer a name-match against the scoreboard's builder line if we have one.
+            if (!builderName.isEmpty() && p.getName().getString().equalsIgnoreCase(builderName)) {
+                builder = p;
+                break;
+            }
+            // Otherwise fall back to whoever stands inside the plot region.
+            if (plotRegion.contains(p.getBlockPos())) {
+                builder = p;
+            }
         }
-        return clean(message.substring(start + loweredPrefix.length()));
+        if (builder == null) return null;
+        net.minecraft.item.ItemStack held = builder.getMainHandStack();
+        if (held == null || held.isEmpty()) return null;
+        if (!(held.getItem() instanceof net.minecraft.item.BlockItem blockItem)) return null;
+        net.minecraft.util.Identifier id = Registries.BLOCK.getId(blockItem.getBlock());
+        return id == null ? null : id.getPath();
     }
 
-    private boolean isWhiteTerracotta(BlockState state) {
-        String blockId = Registries.BLOCK.getId(state.getBlock()).getPath();
-        return "white_terracotta".equals(blockId)
-                || "hardened_clay".equals(blockId)
-                || "white_stained_hardened_clay".equals(blockId);
-    }
-
-    private boolean isIgnoredBuildBlock(String blockId) {
-        return ABSOLUTE_SCAN_IGNORES.contains(blockId);
-    }
-
-    private boolean isWithinTrackedPlot(BlockPos pos, PlotAnchor anchor) {
-        if (!anchor.isValid()) {
-            return false;
+    /**
+     * When the primary scoring returns nothing, surface a small set of common
+     * priors so the bot still has something to guess. Avoids the "silent bot"
+     * regression where pre-hint scanner finds no match.
+     */
+    private List<ScoredTheme> fallbackScanGuesses(BuildFingerprint fp) {
+        List<ScoredTheme> fallback = new ArrayList<>();
+        PandoraConfig config = PandoraConfig.getInstance();
+        for (Map.Entry<String, Double> e : COMMON_THEME_PRIORS.entrySet()) {
+            String key = e.getKey();
+            String original = themeKeyToOriginal.get(key);
+            if (original == null) continue;
+            double score = e.getValue() + config.getThemeFrequency(original) * 0.3;
+            if (fp != null && fp.dominantBlockId() != null) {
+                // Slight nudge if any token from the build matches the prior theme name.
+                for (String token : GTBBlockSignatures.tokenize(fp.dominantBlockId())) {
+                    if (key.contains(token)) {
+                        score += 1.5;
+                        break;
+                    }
+                }
+            }
+            fallback.add(new ScoredTheme(original, score));
         }
-        BlockPos center = anchor.center();
-        return pos.getX() >= center.getX() - PLOT_HALF_SIZE
-                && pos.getX() <= center.getX() + PLOT_HALF_SIZE
-                && pos.getZ() >= center.getZ() - PLOT_HALF_SIZE
-                && pos.getZ() <= center.getZ() + PLOT_HALF_SIZE
-                && pos.getY() >= anchor.floorY() + PLOT_SCAN_MIN_Y
-                && pos.getY() <= anchor.floorY() + PLOT_SCAN_MAX_Y;
+        fallback.sort(Comparator.comparingDouble(ScoredTheme::score).reversed());
+        if (fallback.size() > 8) fallback = fallback.subList(0, 8);
+        return fallback;
+    }
+
+    private static boolean isWhiteTerracotta(BlockState state) {
+        String id = Registries.BLOCK.getId(state.getBlock()).getPath();
+        return "white_terracotta".equals(id) || "hardened_clay".equals(id) || "white_stained_hardened_clay".equals(id);
     }
 
     private static String clean(String value) {
@@ -1338,54 +1677,37 @@ public class GTBSolverEngine {
         return value.codePointCount(0, value.length());
     }
 
-    private static String normalizeTheme(String value) {
-        return value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").trim();
-    }
-
-    private static boolean containsAny(String value, String... needles) {
-        for (String needle : needles) {
-            if (value.contains(needle)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static double triColorScore(BlockScan scan, String first, String second, String third) {
-        return Math.min(capped(scan.count(first), 30), Math.min(capped(scan.count(second), 30), capped(scan.count(third), 30)));
-    }
-
-    private static double capped(int value, int cap) {
-        return Math.min(value, cap);
-    }
+    // ===================== Inner types =====================
 
     private record ScoredTheme(String theme, double score) {
     }
 
-    private record PlotAnchor(BlockPos center, int floorY, double confidence) {
-        private static PlotAnchor unknown() {
-            return new PlotAnchor(BlockPos.ORIGIN, 0, Double.NEGATIVE_INFINITY);
-        }
-
-        private boolean isValid() {
-            return confidence > Double.NEGATIVE_INFINITY / 2.0;
-        }
-
-        private PlotAnchor shift(int xShift, int zShift) {
-            return new PlotAnchor(center.add(xShift, 0, zShift), floorY, confidence - Math.abs(xShift) - Math.abs(zShift));
-        }
-    }
-
-    private record GameContext(boolean inGuessTheBuild, boolean activeRound, boolean allowPreHint, String roundKey, PlotAnchor plotAnchor, boolean revealedThemeVisible) {
+    private record GameContext(boolean inGuessTheBuild, boolean activeRound, String roundKey, boolean revealedThemeVisible) {
         private static GameContext inactive() {
-            return new GameContext(false, false, false, "", PlotAnchor.unknown(), false);
+            return new GameContext(false, false, "", false);
         }
     }
 
-    private static class BlockScan {
+    private record PlotRegion(int centerX, int floorY, int centerZ) {
+        boolean contains(BlockPos pos) {
+            return pos.getX() >= centerX - PLOT_HALF_SIZE
+                    && pos.getX() <= centerX + PLOT_HALF_SIZE
+                    && pos.getZ() >= centerZ - PLOT_HALF_SIZE
+                    && pos.getZ() <= centerZ + PLOT_HALF_SIZE
+                    && pos.getY() >= floorY - PLOT_SCAN_BELOW
+                    && pos.getY() <= floorY + PLOT_SCAN_ABOVE;
+        }
+    }
+
+    /**
+     * Aggregated stats for the currently placed blocks within a plot region.
+     */
+    private static final class BuildFingerprint {
+        private final Map<String, Integer> blockIdCounts = new HashMap<>();
         private final Map<String, Integer> tokenCounts = new HashMap<>();
+        private final Map<String, Integer> singleBlockThemeHits = new HashMap<>();
         private final Set<Long> positions = new HashSet<>();
-        private final BlockPos center;
+        private final PlotRegion region;
         private int totalBlocks;
         private int minX = Integer.MAX_VALUE;
         private int maxX = Integer.MIN_VALUE;
@@ -1393,14 +1715,29 @@ public class GTBSolverEngine {
         private int maxY = Integer.MIN_VALUE;
         private int minZ = Integer.MAX_VALUE;
         private int maxZ = Integer.MIN_VALUE;
+        private String dominantBlockId;
+        private String dominantColor;
 
-        private BlockScan(BlockPos center) {
-            this.center = center;
+        private BuildFingerprint(PlotRegion region) {
+            this.region = region;
         }
 
-        private void add(BlockPos pos, String blockPath) {
+        static BuildFingerprint fromPlaced(Map<Long, String> placed, PlotRegion region) {
+            BuildFingerprint fp = new BuildFingerprint(region);
+            // Snapshot the map first; the source map is concurrently mutated from
+            // the network thread when block updates arrive.
+            Map<Long, String> snapshot = new HashMap<>(placed);
+            for (Map.Entry<Long, String> entry : snapshot.entrySet()) {
+                BlockPos pos = BlockPos.fromLong(entry.getKey());
+                fp.add(pos, entry.getValue());
+            }
+            fp.finalizeStats();
+            return fp;
+        }
+
+        private void add(BlockPos pos, String blockId) {
             totalBlocks++;
-            positions.add(pack(pos.getX(), pos.getY(), pos.getZ()));
+            positions.add(pos.asLong());
             minX = Math.min(minX, pos.getX());
             maxX = Math.max(maxX, pos.getX());
             minY = Math.min(minY, pos.getY());
@@ -1408,119 +1745,153 @@ public class GTBSolverEngine {
             minZ = Math.min(minZ, pos.getZ());
             maxZ = Math.max(maxZ, pos.getZ());
 
-            addToken(blockPath);
-            for (String part : blockPath.split("_")) {
-                addToken(part);
+            blockIdCounts.merge(blockId, 1, Integer::sum);
+            for (String token : GTBBlockSignatures.tokenize(blockId)) {
+                tokenCounts.merge(token, 1, Integer::sum);
             }
-
-            if (blockPath.endsWith("_stained_hardened_clay") || blockPath.endsWith("_terracotta")) {
-                addToken("terracotta");
-                addToken("clay");
-            }
-            if (blockPath.endsWith("_stained_glass") || blockPath.endsWith("_stained_glass_pane")) {
-                addToken("glass");
-            }
-            if (blockPath.endsWith("_wool") || blockPath.endsWith("_carpet")) {
-                addToken("wool");
-            }
-            if (blockPath.contains("log") || blockPath.contains("planks")) {
-                addToken("wood");
-            }
-            if (blockPath.contains("leaves")) {
-                addToken("green");
+            for (String themeHint : GTBBlockSignatures.singleBlockThemes(blockId)) {
+                singleBlockThemeHits.merge(themeHint.toLowerCase(Locale.ROOT), 1, Integer::sum);
             }
         }
 
-        private void addToken(String token) {
-            tokenCounts.merge(token, 1, Integer::sum);
+        private void finalizeStats() {
+            int bestCount = 0;
+            for (Map.Entry<String, Integer> e : blockIdCounts.entrySet()) {
+                if (e.getValue() > bestCount) {
+                    bestCount = e.getValue();
+                    dominantBlockId = e.getKey();
+                }
+            }
+            int bestColorCount = 0;
+            for (String color : GTBBlockSignatures.COLOR_TOKENS) {
+                Integer c = tokenCounts.get(color);
+                if (c != null && c > bestColorCount) {
+                    bestColorCount = c;
+                    dominantColor = color;
+                }
+            }
+            // Collapse silver→gray if both present (1.8.9 light_gray reads as silver).
+            if ("silver".equals(dominantColor)) dominantColor = "gray";
         }
 
-        private int count(String token) {
+        int totalBlocks() {
+            return totalBlocks;
+        }
+
+        int tokenCount(String token) {
             return tokenCounts.getOrDefault(token, 0);
         }
 
-        private int width() {
+        /**
+         * Records a token from an out-of-band source (e.g. the builder's held
+         * item) so the scoring sees it but it doesn't inflate totalBlocks or
+         * bounding-box stats. Counted as a single occurrence.
+         */
+        void addExtraToken(String token) {
+            if (token == null || token.isBlank()) return;
+            for (String t : GTBBlockSignatures.tokenize(token)) {
+                tokenCounts.merge(t, 1, Integer::sum);
+            }
+        }
+
+        int blockIdCount(String id) {
+            return blockIdCounts.getOrDefault(id, 0);
+        }
+
+        Set<String> tokens() {
+            return tokenCounts.keySet();
+        }
+
+        Set<String> singleBlockThemeHints() {
+            return singleBlockThemeHits.keySet();
+        }
+
+        int singleBlockThemeHitCount(String themeKey) {
+            return singleBlockThemeHits.getOrDefault(themeKey, 0);
+        }
+
+        String dominantBlockId() {
+            return dominantBlockId;
+        }
+
+        String dominantColor() {
+            return dominantColor;
+        }
+
+        int width() {
             return maxX >= minX ? maxX - minX + 1 : 0;
         }
 
-        private int depth() {
+        int depth() {
             return maxZ >= minZ ? maxZ - minZ + 1 : 0;
         }
 
-        private int height() {
+        int height() {
             return maxY >= minY ? maxY - minY + 1 : 0;
         }
 
-        private boolean isTall() {
+        int maxFootprint() {
+            return Math.max(width(), depth());
+        }
+
+        boolean isFlat() {
+            return height() <= 3;
+        }
+
+        boolean isTall() {
             return height() >= Math.max(width(), depth()) && height() >= 6;
         }
 
-        private boolean isFlat() {
-            return height() <= 4;
+        boolean isWide() {
+            return Math.max(width(), depth()) >= 9 && height() <= 6;
         }
 
-        private boolean isWide() {
-            return Math.max(width(), depth()) >= 10 && height() <= 8;
-        }
-
-        private boolean isSquareish() {
-            int width = width();
-            int depth = depth();
-            return width > 0 && depth > 0 && Math.abs(width - depth) <= 3;
-        }
-
-        private double symmetryX() {
-            if (positions.isEmpty()) {
-                return 0.0;
+        boolean isRoundish() {
+            int w = width();
+            int d = depth();
+            if (w < 4 || d < 4 || Math.abs(w - d) > 2) return false;
+            // Project to XZ plane: count unique (x,z) positions, then check that the
+            // 4 corners of the bounding box are NOT placed (a circle inscribed in a
+            // square leaves the corners empty).
+            Set<Long> xz = new HashSet<>();
+            for (long packed : positions) {
+                BlockPos p = BlockPos.fromLong(packed);
+                xz.add(((long) p.getX() << 32) | (p.getZ() & 0xFFFFFFFFL));
             }
+            long c1 = ((long) minX << 32) | (minZ & 0xFFFFFFFFL);
+            long c2 = ((long) minX << 32) | (maxZ & 0xFFFFFFFFL);
+            long c3 = ((long) maxX << 32) | (minZ & 0xFFFFFFFFL);
+            long c4 = ((long) maxX << 32) | (maxZ & 0xFFFFFFFFL);
+            int filledCorners = 0;
+            if (xz.contains(c1)) filledCorners++;
+            if (xz.contains(c2)) filledCorners++;
+            if (xz.contains(c3)) filledCorners++;
+            if (xz.contains(c4)) filledCorners++;
+            return filledCorners <= 1;
+        }
 
-            double mirror = center.getX();
+        double symmetryX() {
+            if (positions.isEmpty()) return 0.0;
+            double mirror = (minX + maxX) / 2.0;
             int matches = 0;
             for (long packed : positions) {
-                int x = unpackX(packed);
-                int y = unpackY(packed);
-                int z = unpackZ(packed);
-                int reflectedX = (int) Math.round(mirror - (x - mirror));
-                if (positions.contains(pack(reflectedX, y, z))) {
-                    matches++;
-                }
+                BlockPos p = BlockPos.fromLong(packed);
+                int reflectedX = (int) Math.round(2 * mirror - p.getX());
+                if (positions.contains(new BlockPos(reflectedX, p.getY(), p.getZ()).asLong())) matches++;
             }
             return matches / (double) positions.size();
         }
 
-        private double symmetryZ() {
-            if (positions.isEmpty()) {
-                return 0.0;
-            }
-
-            double mirror = center.getZ();
+        double symmetryZ() {
+            if (positions.isEmpty()) return 0.0;
+            double mirror = (minZ + maxZ) / 2.0;
             int matches = 0;
             for (long packed : positions) {
-                int x = unpackX(packed);
-                int y = unpackY(packed);
-                int z = unpackZ(packed);
-                int reflectedZ = (int) Math.round(mirror - (z - mirror));
-                if (positions.contains(pack(x, y, reflectedZ))) {
-                    matches++;
-                }
+                BlockPos p = BlockPos.fromLong(packed);
+                int reflectedZ = (int) Math.round(2 * mirror - p.getZ());
+                if (positions.contains(new BlockPos(p.getX(), p.getY(), reflectedZ).asLong())) matches++;
             }
             return matches / (double) positions.size();
-        }
-
-        private static long pack(int x, int y, int z) {
-            return (((long) x) & 0x3FFFFFFL) << 38 | ((((long) z) & 0x3FFFFFFL) << 12) | (((long) y) & 0xFFFL);
-        }
-
-        private static int unpackX(long packed) {
-            return (int) (packed >> 38);
-        }
-
-        private static int unpackY(long packed) {
-            return (int) (packed << 52 >> 52);
-        }
-
-        private static int unpackZ(long packed) {
-            return (int) (packed << 26 >> 38);
         }
     }
 }

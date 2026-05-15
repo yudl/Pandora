@@ -7,6 +7,8 @@ import com.garous.pandora.module.ModuleManager;
 import com.garous.pandora.module.setting.BooleanSetting;
 import com.garous.pandora.module.setting.ModeSetting;
 import com.garous.pandora.module.setting.ModuleSetting;
+import com.garous.pandora.module.setting.NumberRangeSetting;
+import com.garous.pandora.module.setting.NumberSetting;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.text.Text;
@@ -23,26 +25,27 @@ import java.util.Map;
  */
 public class ClickGUIScreen extends Screen {
 
-    private static final int PANEL_WIDTH = 138;
+    private static final int PANEL_WIDTH = 150;
     private static final int HEADER_HEIGHT = 19;
     private static final int MODULE_HEIGHT = 17;
-    private static final int SETTING_HEIGHT = 16;
+    private static final int SETTING_HEIGHT = 14;
     private static final int INDENT = 9;
-    private static final float SCREEN_ANIMATION_SPEED = 9.0f;
-    private static final float PANEL_ANIMATION_SPEED = 30.0f;
+    private static final float SCREEN_ANIMATION_SPEED = 14.0f;
+    // 720 px/s — a 4-row dropdown opens in ~80 ms instead of 2+ seconds.
+    private static final float PANEL_ANIMATION_SPEED = 720.0f;
 
-    private static final int COLOR_OVERLAY = 0xAA050509;
-    private static final int COLOR_PANEL_BG = 0xEE101014;
-    private static final int COLOR_PANEL_BORDER = 0xAA282834;
-    private static final int COLOR_HEADER_BG = 0xFA18181D;
+    private static final int COLOR_OVERLAY = 0x88161620;
+    private static final int COLOR_PANEL_BG = 0xEE1B1B23;
+    private static final int COLOR_PANEL_BORDER = 0xAA3A3A4A;
+    private static final int COLOR_HEADER_BG = 0xFA22222B;
     private static final int COLOR_HEADER_TEXT = 0xFFFFFFFF;
     private static final int COLOR_MODULE_ENABLED = 0xFFFF4FD8;
     private static final int COLOR_MODULE_DISABLED = 0xFFE6E6EB;
     private static final int COLOR_MODULE_ENABLED_BG = 0x553A123A;
     private static final int COLOR_MODULE_HOVER = 0x45FF4FD8;
-    private static final int COLOR_MODULE_ROW = 0xD018181D;
-    private static final int COLOR_SETTING_BG = 0xCC121218;
-    private static final int COLOR_SETTING_ALT_BG = 0xCC16161D;
+    private static final int COLOR_MODULE_ROW = 0xD021212B;
+    private static final int COLOR_SETTING_BG = 0xCC1B1B24;
+    private static final int COLOR_SETTING_ALT_BG = 0xCC20202A;
     private static final int COLOR_ACCENT = 0xFFFF4FD8;
     private static final int COLOR_MUTED = 0xFF9292A3;
     private static final int COLOR_CHECKBOX = 0xFF23232E;
@@ -147,6 +150,9 @@ public class ClickGUIScreen extends Screen {
         }
 
         if (leftReleased) {
+            for (ModuleUiState state : moduleStates.values()) {
+                state.draggingSliderId = null;
+            }
             panels.forEach(panel -> {
                 if (panel.dragging) {
                     panel.dragging = false;
@@ -162,6 +168,7 @@ public class ClickGUIScreen extends Screen {
                     panel.y = (int) mouseY - panel.dragOffsetY;
                 }
             }
+            updateSliderDrag(mouseX);
         }
 
         if (!leftClicked && !rightClicked) {
@@ -229,6 +236,42 @@ public class ClickGUIScreen extends Screen {
                         continue;
                     }
 
+                    if (setting instanceof NumberSetting numberSetting) {
+                        if (isInside(mouseX, mouseY, panel.x, currentY, PANEL_WIDTH, SETTING_HEIGHT) && leftClicked) {
+                            int trackX = panel.x + INDENT + 40;
+                            int trackW = PANEL_WIDTH - INDENT - 40 - 20;
+                            state.draggingSliderId = numberSetting.getId();
+                            state.draggingSliderHandle = 0;
+                            state.dragTrackX = trackX;
+                            state.dragTrackW = trackW;
+                            applyNumberSliderDrag(numberSetting, mouseX);
+                            PandoraConfig.getInstance().setModuleTextOption(module.getName(), numberSetting.getId(), Integer.toString(numberSetting.getValue()));
+                            return;
+                        }
+                        currentY += SETTING_HEIGHT;
+                        continue;
+                    }
+                    if (setting instanceof NumberRangeSetting rangeSetting) {
+                        if (isInside(mouseX, mouseY, panel.x, currentY, PANEL_WIDTH, SETTING_HEIGHT) && leftClicked) {
+                            int trackX = panel.x + INDENT + 40;
+                            int trackW = PANEL_WIDTH - INDENT - 40 - 30;
+                            int range = Math.max(1, rangeSetting.getMax() - rangeSetting.getMin());
+                            int lowX = trackX + Math.round((rangeSetting.getLow() - rangeSetting.getMin()) * (float) trackW / range);
+                            int highX = trackX + Math.round((rangeSetting.getHigh() - rangeSetting.getMin()) * (float) trackW / range);
+                            // Pick the closer handle.
+                            state.draggingSliderId = rangeSetting.getId();
+                            state.draggingSliderHandle = Math.abs(mouseX - lowX) <= Math.abs(mouseX - highX) ? 0 : 1;
+                            state.dragTrackX = trackX;
+                            state.dragTrackW = trackW;
+                            applyRangeSliderDrag(rangeSetting, state.draggingSliderHandle, mouseX);
+                            PandoraConfig.getInstance().setModuleTextOption(module.getName(), rangeSetting.getId(),
+                                    rangeSetting.getLow() + "-" + rangeSetting.getHigh());
+                            return;
+                        }
+                        currentY += SETTING_HEIGHT;
+                        continue;
+                    }
+
                     if (setting instanceof ModeSetting modeSetting) {
                         if (isInside(mouseX, mouseY, panel.x, currentY, PANEL_WIDTH, SETTING_HEIGHT)) {
                             if (leftClicked || rightClicked) {
@@ -256,8 +299,19 @@ public class ClickGUIScreen extends Screen {
         }
     }
 
+    /**
+     * Accent colour used for the leading 'P' in the watermark. The HUD's
+     * ArrayList module updates this to its current colour so the logo stays
+     * in sync with the user's theme; until that module is enabled it
+     * falls back to the panel accent.
+     */
+    public static volatile int WATERMARK_P_COLOR = COLOR_ACCENT;
+
     private void renderWatermark(DrawContext context, float alpha) {
-        context.drawTextWithShadow(this.textRenderer, "Pandora B1", 5, 4, withAlpha(COLOR_ACCENT, alpha));
+        int pColor = withAlpha(WATERMARK_P_COLOR, alpha);
+        context.drawTextWithShadow(this.textRenderer, "P", 5, 4, pColor);
+        int pWidth = this.textRenderer.getWidth("P");
+        context.drawTextWithShadow(this.textRenderer, "andora B1", 5 + pWidth, 4, withAlpha(COLOR_ACCENT, alpha));
     }
 
     private void renderPanel(DrawContext context, Panel panel, int mouseX, int mouseY, float frameDelta, float alpha, int offsetY) {
@@ -306,6 +360,19 @@ public class ClickGUIScreen extends Screen {
         for (ModuleSetting<?> setting : module.getSettings()) {
             if (setting instanceof BooleanSetting booleanSetting) {
                 renderBooleanSetting(context, booleanSetting, x, currentY, mouseX, mouseY, alpha);
+                currentY += SETTING_HEIGHT;
+                renderedHeight += SETTING_HEIGHT;
+                continue;
+            }
+
+            if (setting instanceof NumberSetting numberSetting) {
+                renderNumberSetting(context, numberSetting, x, currentY, alpha);
+                currentY += SETTING_HEIGHT;
+                renderedHeight += SETTING_HEIGHT;
+                continue;
+            }
+            if (setting instanceof NumberRangeSetting rangeSetting) {
+                renderNumberRangeSetting(context, rangeSetting, x, currentY, alpha);
                 currentY += SETTING_HEIGHT;
                 renderedHeight += SETTING_HEIGHT;
                 continue;
@@ -377,6 +444,42 @@ public class ClickGUIScreen extends Screen {
         if (setting.getValue()) {
             context.fill(boxX + 2, boxY + 2, boxX + boxSize - 2, boxY + boxSize - 2, withAlpha(COLOR_ACCENT, alpha));
         }
+    }
+
+    private void renderNumberSetting(DrawContext context, NumberSetting setting, int x, int y, float alpha) {
+        context.fill(x, y, x + PANEL_WIDTH, y + SETTING_HEIGHT, withAlpha(COLOR_SETTING_BG, alpha));
+        context.drawTextWithShadow(this.textRenderer, setting.getLabel(), x + INDENT, y + 4, withAlpha(COLOR_MODULE_DISABLED, alpha));
+        String valStr = Integer.toString(setting.getValue());
+        int valW = this.textRenderer.getWidth(valStr);
+        context.drawTextWithShadow(this.textRenderer, valStr, x + PANEL_WIDTH - valW - 8, y + 4, withAlpha(COLOR_ACCENT, alpha));
+
+        int trackX = x + INDENT + 40;
+        int trackW = PANEL_WIDTH - INDENT - 40 - 20;
+        int trackY = y + SETTING_HEIGHT - 4;
+        context.fill(trackX, trackY, trackX + trackW, trackY + 1, withAlpha(COLOR_PANEL_BORDER, alpha));
+        float frac = (setting.getValue() - setting.getMin()) / (float) Math.max(1, setting.getMax() - setting.getMin());
+        int handleX = trackX + Math.round(frac * trackW);
+        context.fill(trackX, trackY, handleX, trackY + 1, withAlpha(COLOR_ACCENT, alpha));
+        context.fill(handleX - 1, trackY - 2, handleX + 2, trackY + 3, withAlpha(COLOR_ACCENT, alpha));
+    }
+
+    private void renderNumberRangeSetting(DrawContext context, NumberRangeSetting setting, int x, int y, float alpha) {
+        context.fill(x, y, x + PANEL_WIDTH, y + SETTING_HEIGHT, withAlpha(COLOR_SETTING_BG, alpha));
+        context.drawTextWithShadow(this.textRenderer, setting.getLabel(), x + INDENT, y + 4, withAlpha(COLOR_MODULE_DISABLED, alpha));
+        String valStr = setting.getLow() + "-" + setting.getHigh();
+        int valW = this.textRenderer.getWidth(valStr);
+        context.drawTextWithShadow(this.textRenderer, valStr, x + PANEL_WIDTH - valW - 8, y + 4, withAlpha(COLOR_ACCENT, alpha));
+
+        int trackX = x + INDENT + 40;
+        int trackW = PANEL_WIDTH - INDENT - 40 - 30;
+        int trackY = y + SETTING_HEIGHT - 4;
+        context.fill(trackX, trackY, trackX + trackW, trackY + 1, withAlpha(COLOR_PANEL_BORDER, alpha));
+        int range = Math.max(1, setting.getMax() - setting.getMin());
+        int lowX = trackX + Math.round((setting.getLow() - setting.getMin()) * (float) trackW / range);
+        int highX = trackX + Math.round((setting.getHigh() - setting.getMin()) * (float) trackW / range);
+        context.fill(lowX, trackY, highX, trackY + 1, withAlpha(COLOR_ACCENT, alpha));
+        context.fill(lowX - 1, trackY - 2, lowX + 2, trackY + 3, withAlpha(COLOR_ACCENT, alpha));
+        context.fill(highX - 1, trackY - 2, highX + 2, trackY + 3, withAlpha(COLOR_ACCENT, alpha));
     }
 
     private void renderModeSetting(DrawContext context, ModuleUiState state, ModeSetting setting, int x, int y, int mouseX, int mouseY, float alpha) {
@@ -458,9 +561,55 @@ public class ClickGUIScreen extends Screen {
         return Math.max(0.0f, Math.min(1.0f, value));
     }
 
+    private void updateSliderDrag(double mouseX) {
+        // Find a module with an active drag and apply it.
+        for (Module module : ModuleManager.getInstance().getModules()) {
+            ModuleUiState state = moduleStates.get(module.getName());
+            if (state == null || state.draggingSliderId == null) continue;
+            for (ModuleSetting<?> setting : module.getSettings()) {
+                if (!setting.getId().equals(state.draggingSliderId)) continue;
+                if (setting instanceof NumberSetting ns) {
+                    applyNumberSliderDrag(ns, mouseX);
+                    PandoraConfig.getInstance().setModuleTextOption(module.getName(), ns.getId(), Integer.toString(ns.getValue()));
+                } else if (setting instanceof NumberRangeSetting nrs) {
+                    applyRangeSliderDrag(nrs, state.draggingSliderHandle, mouseX);
+                    PandoraConfig.getInstance().setModuleTextOption(module.getName(), nrs.getId(),
+                            nrs.getLow() + "-" + nrs.getHigh());
+                }
+                break;
+            }
+        }
+    }
+
+    private void applyNumberSliderDrag(NumberSetting ns, double mouseX) {
+        ModuleUiState state = moduleStates.values().stream()
+                .filter(s -> ns.getId().equals(s.draggingSliderId)).findFirst().orElse(null);
+        if (state == null) return;
+        float frac = clamp((float) ((mouseX - state.dragTrackX) / Math.max(1, state.dragTrackW)));
+        int range = ns.getMax() - ns.getMin();
+        ns.setValue(Math.round(ns.getMin() + frac * range));
+    }
+
+    private void applyRangeSliderDrag(NumberRangeSetting nrs, int handle, double mouseX) {
+        ModuleUiState state = moduleStates.values().stream()
+                .filter(s -> nrs.getId().equals(s.draggingSliderId)).findFirst().orElse(null);
+        if (state == null) return;
+        float frac = clamp((float) ((mouseX - state.dragTrackX) / Math.max(1, state.dragTrackW)));
+        int range = nrs.getMax() - nrs.getMin();
+        int value = Math.round(nrs.getMin() + frac * range);
+        if (handle == 0) nrs.setLow(value); else nrs.setHigh(value);
+    }
+
     private static class ModuleUiState {
         private boolean expanded;
         private String openModeId;
+        /** Setting id of the slider currently being dragged, or null. */
+        private String draggingSliderId;
+        /** For NumberRangeSetting: 0 = low handle, 1 = high handle. Ignored for NumberSetting. */
+        private int draggingSliderHandle;
+        /** Cached track geometry for the active drag (panelX, trackY, trackX, trackW). */
+        private int dragTrackX;
+        private int dragTrackW;
     }
 
     private static class Panel {

@@ -1461,7 +1461,8 @@ public class GTBSolverEngine {
         boolean scoreboardGtb = mentionsGtb(title)
                 || lines.stream().anyMatch(GTBSolverEngine::mentionsGtb);
         boolean inGuessTheBuild = scoreboardGtb || ((recentRound || recentHint) && recentBuilder)
-                || (recentRound && recentHint);
+                || (recentRound && recentHint)
+                || com.garous.pandora.net.HypixelApiClient.getInstance().isInGuessTheBuild();
 
         String builderLine = findLine(lines, "builder");
         String timeLine = findLine(lines, "time");

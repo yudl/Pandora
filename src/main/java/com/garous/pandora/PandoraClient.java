@@ -7,6 +7,7 @@ import com.garous.pandora.config.PandoraConfig;
 import com.garous.pandora.module.Module;
 import com.garous.pandora.module.ModuleManager;
 import com.garous.pandora.module.modules.HudModule;
+import com.garous.pandora.net.HypixelApiClient;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
@@ -67,6 +68,7 @@ public class PandoraClient implements ClientModInitializer {
 
             // Tick all enabled modules
             ModuleManager.getInstance().onTick();
+            HypixelApiClient.getInstance().tick();
         });
 
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> PandoraConfig.getInstance().save());

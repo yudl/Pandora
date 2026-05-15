@@ -8,6 +8,7 @@ import com.garous.pandora.module.ModuleManager;
 import com.garous.pandora.module.setting.BooleanSetting;
 import com.garous.pandora.module.setting.ModeSetting;
 import com.garous.pandora.module.setting.ModuleSetting;
+import com.garous.pandora.module.setting.NumberSetting;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
@@ -46,12 +47,13 @@ public class HudModule extends Module {
             List.of(STYLE_NORMAL, STYLE_BAR), STYLE_NORMAL);
     private final BooleanSetting background = new BooleanSetting("background", "background", true);
     private final BooleanSetting suffixes = new BooleanSetting("suffixes", "suffixes", true);
-    /** Hex string editable from config; small/simple stand-in for a full HSV picker. */
-    private final ModeSetting staticColor = new ModeSetting("static_color", "static-hex",
-            List.of("#ff4fd8", "#ff5050", "#50d0ff", "#5dff80", "#ffd050", "#a060ff"), "#ff4fd8");
+    // HSV triple, surfaced as 3 sliders. Used when colorMode == STATIC.
+    private final NumberSetting hue = new NumberSetting("hue", "hue", 0, 360, 320);
+    private final NumberSetting saturation = new NumberSetting("saturation", "sat", 0, 100, 80);
+    private final NumberSetting brightness = new NumberSetting("brightness", "bri", 0, 100, 100);
 
     private final List<ModuleSetting<?>> settings = List.of(
-            arrayList, position, colorMode, style, background, suffixes, staticColor
+            arrayList, position, colorMode, style, background, suffixes, hue, saturation, brightness
     );
 
     public HudModule() {
@@ -72,7 +74,14 @@ public class HudModule extends Module {
         style.setValue(config.getModuleTextOption(getName(), style.getId(), STYLE_NORMAL));
         background.setValue(config.getModuleOption(getName(), background.getId(), true));
         suffixes.setValue(config.getModuleOption(getName(), suffixes.getId(), true));
-        staticColor.setValue(config.getModuleTextOption(getName(), staticColor.getId(), "#ff4fd8"));
+        hue.setValue(parseIntOr(config.getModuleTextOption(getName(), hue.getId(), "320"), 320));
+        saturation.setValue(parseIntOr(config.getModuleTextOption(getName(), saturation.getId(), "80"), 80));
+        brightness.setValue(parseIntOr(config.getModuleTextOption(getName(), brightness.getId(), "100"), 100));
+    }
+
+    private static int parseIntOr(String s, int fallback) {
+        if (s == null) return fallback;
+        try { return Integer.parseInt(s.trim()); } catch (NumberFormatException e) { return fallback; }
     }
 
     public boolean isArrayListEnabled() {
@@ -115,7 +124,7 @@ public class HudModule extends Module {
         int y = anchorTop ? 2 : screenH - blockHeight - 2;
 
         long now = System.currentTimeMillis();
-        int staticArgb = parseHex(staticColor.getValue());
+        int staticArgb = java.awt.Color.HSBtoRGB(hue.getValue() / 360f, saturation.getValue() / 100f, brightness.getValue() / 100f);
         boolean gradient = COLOR_GRADIENT.equalsIgnoreCase(colorMode.getValue());
 
         for (int i = 0; i < entries.size(); i++) {
@@ -173,16 +182,4 @@ public class HudModule extends Module {
         return java.awt.Color.HSBtoRGB(hue, 0.65f, 1.0f);
     }
 
-    private int parseHex(String hex) {
-        if (hex == null) return 0xFFFF4FD8;
-        String s = hex.trim().toLowerCase(Locale.ROOT);
-        if (s.startsWith("#")) s = s.substring(1);
-        try {
-            int v = Integer.parseUnsignedInt(s, 16);
-            if (s.length() == 6) v |= 0xFF000000;
-            return v;
-        } catch (NumberFormatException ignored) {
-            return 0xFFFF4FD8;
-        }
-    }
 }

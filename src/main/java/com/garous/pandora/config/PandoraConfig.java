@@ -20,14 +20,24 @@ public class PandoraConfig {
     private static final PandoraConfig INSTANCE = new PandoraConfig();
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    private final Path configPath = FabricLoader.getInstance().getConfigDir().resolve("pandora.json");
+    // All Pandora client data lives under .minecraft/pandora/ so settings,
+    // theme history, and any future per-client state stay together. We still
+    // migrate from the historical .minecraft/config/pandora.json the first
+    // time we run on a profile that has it.
+    private final Path configPath = FabricLoader.getInstance().getGameDir().resolve("pandora").resolve("pandora.json");
+    private final Path legacyConfigPath = FabricLoader.getInstance().getConfigDir().resolve("pandora.json");
     private ConfigData data = new ConfigData();
 
     public static PandoraConfig getInstance() {
         return INSTANCE;
     }
 
+    public Path getConfigDirectory() {
+        return configPath.getParent();
+    }
+
     public void load() {
+        migrateLegacyConfigIfNeeded();
         if (!Files.exists(configPath)) {
             save();
             return;
@@ -41,6 +51,18 @@ public class PandoraConfig {
             Pandora.LOGGER.warn("[Pandora] Failed to load config, using defaults.", exception);
             data = new ConfigData();
             save();
+        }
+    }
+
+    private void migrateLegacyConfigIfNeeded() {
+        if (Files.exists(configPath)) return;
+        if (!Files.exists(legacyConfigPath)) return;
+        try {
+            Files.createDirectories(configPath.getParent());
+            Files.copy(legacyConfigPath, configPath);
+            Pandora.LOGGER.info("[Pandora] Migrated config from {} to {}", legacyConfigPath, configPath);
+        } catch (IOException exception) {
+            Pandora.LOGGER.warn("[Pandora] Couldn't migrate legacy config; starting fresh.", exception);
         }
     }
 

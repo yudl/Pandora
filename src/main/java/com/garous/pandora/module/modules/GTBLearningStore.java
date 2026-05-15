@@ -1,11 +1,13 @@
 package com.garous.pandora.module.modules;
 
 import com.garous.pandora.Pandora;
+import com.garous.pandora.config.PandoraConfig;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 import net.fabricmc.loader.api.FabricLoader;
 
+import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
 import java.lang.reflect.Type;
@@ -40,7 +42,11 @@ public final class GTBLearningStore {
     private static final int MAX_HISTORY_PER_THEME = 50;
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    private final Path filePath = FabricLoader.getInstance().getConfigDir().resolve("pandora-gtb-history.json");
+    // Lives next to pandora.json under .minecraft/pandora/. The first-run
+    // migration below copies the file from the old .minecraft/config/
+    // location if it exists there.
+    private final Path filePath = PandoraConfig.getInstance().getConfigDirectory().resolve("gtb-history.json");
+    private final Path legacyFilePath = FabricLoader.getInstance().getConfigDir().resolve("pandora-gtb-history.json");
 
     // theme (lowercase) -> { rounds: int, tokens: {token -> count}, guesses: [...], lastSeen: epochSec }
     private final Map<String, ThemeEntry> themes = new ConcurrentHashMap<>();
@@ -54,6 +60,7 @@ public final class GTBLearningStore {
     }
 
     public void load() {
+        migrateLegacyIfNeeded();
         if (!Files.exists(filePath)) return;
         try (Reader reader = Files.newBufferedReader(filePath, StandardCharsets.UTF_8)) {
             Type type = new TypeToken<Map<String, ThemeEntry>>() {}.getType();
@@ -74,6 +81,18 @@ public final class GTBLearningStore {
             Pandora.LOGGER.info("[GTBSolver] loaded {} learned theme entries.", themes.size());
         } catch (Exception exception) {
             Pandora.LOGGER.warn("[GTBSolver] Failed to load learning store; starting fresh.", exception);
+        }
+    }
+
+    private void migrateLegacyIfNeeded() {
+        if (Files.exists(filePath)) return;
+        if (!Files.exists(legacyFilePath)) return;
+        try {
+            Files.createDirectories(filePath.getParent());
+            Files.copy(legacyFilePath, filePath);
+            Pandora.LOGGER.info("[GTBSolver] Migrated learning store from {} to {}", legacyFilePath, filePath);
+        } catch (IOException exception) {
+            Pandora.LOGGER.warn("[GTBSolver] Couldn't migrate legacy learning store.", exception);
         }
     }
 

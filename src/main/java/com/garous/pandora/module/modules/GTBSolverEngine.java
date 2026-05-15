@@ -138,6 +138,7 @@ public class GTBSolverEngine {
     private int autoGuessMaxDelayMs = 5_000;
     private String lastSentGuess = "";
     private boolean roundGuessLocked;
+    private boolean suppressEmptyMatchChat;
 
     // Round / game signals
     private String activeRoundKey = "";
@@ -179,6 +180,7 @@ public class GTBSolverEngine {
     private GTBSolverEngine() {
         loadTranslationData();
         buildThemeTokenIndex();
+        GTBLearningStore.getInstance().load();
     }
 
     // ===================== Public API =====================
@@ -203,6 +205,7 @@ public class GTBSolverEngine {
                      int minDelayMs, int maxDelayMs) {
         this.autoGuessMinDelayMs = Math.max(500, minDelayMs);
         this.autoGuessMaxDelayMs = Math.max(this.autoGuessMinDelayMs, maxDelayMs);
+        this.suppressEmptyMatchChat = !GTBSolverModule.MODE_MANUAL.equalsIgnoreCase(guessMode);
         flushPendingSuggestions();
 
         long now = System.currentTimeMillis();
@@ -249,7 +252,13 @@ public class GTBSolverEngine {
             return;
         }
 
-        if (useScanner && hasRecentRound) {
+        // The scanner runs as long as we're recognised as being in GTB. The
+        // earlier gate (require an "active round") meant scoreboards without a
+        // distinct Builder/Round line silently never kicked it in. Keeping the
+        // gate at inGuessTheBuild() lets the scanner run even pre-hint and in
+        // the pre-game lobby without harm — when there's no plot region it
+        // just no-ops.
+        if (useScanner) {
             ensurePlotAnchor(now);
             if (now - lastScanAt >= SCAN_INTERVAL_MS) {
                 lastScanAt = now;
@@ -601,7 +610,11 @@ public class GTBSolverEngine {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
         if (matches.isEmpty()) {
-            client.player.sendMessage(prefix().append(Text.literal("No GTB matches found.").formatted(Formatting.GRAY)), false);
+            // In auto modes, surfacing this on every hint update creates chat
+            // spam — keep it to a quiet HUD-only update.
+            if (!suppressEmptyMatchChat) {
+                client.player.sendMessage(prefix().append(Text.literal("No GTB matches found.").formatted(Formatting.GRAY)), false);
+            }
             hudStatus = "no hint matches";
             return;
         }
@@ -689,6 +702,23 @@ public class GTBSolverEngine {
         PandoraConfig config = PandoraConfig.getInstance();
         config.incrementThemeFrequency(revealed);
         if (revealed.equalsIgnoreCase(lastScannerTheme)) config.incrementThemeFrequency(revealed);
+
+        // Record the round in the learning store so the next time this theme
+        // (or one with similar blocks) appears, the scanner has prior knowledge.
+        Map<String, Integer> tokensSeen = collectTokenCounts();
+        if (!tokensSeen.isEmpty() || !guessHistory.isEmpty()) {
+            GTBLearningStore.getInstance().recordRound(revealed, tokensSeen, new ArrayList<>(guessHistory));
+        }
+    }
+
+    private Map<String, Integer> collectTokenCounts() {
+        if (plotRegion == null || placed.isEmpty()) return Map.of();
+        BuildFingerprint fp = BuildFingerprint.fromPlaced(placed, plotRegion);
+        Map<String, Integer> counts = new HashMap<>();
+        for (String token : fp.tokens()) {
+            counts.put(token, fp.tokenCount(token));
+        }
+        return counts;
     }
 
     private void clearAutoGuessOnRoundMessage(String message) {
@@ -805,7 +835,17 @@ public class GTBSolverEngine {
         }
 
         BuildFingerprint fp = BuildFingerprint.fromPlaced(placed, plotRegion);
+        // Augment with the builder's held block as a soft hint — useful when the
+        // builder is reaching for a new block before placing it.
+        String builderHeldToken = readBuilderHeldBlockToken();
+        if (builderHeldToken != null) fp.addExtraToken(builderHeldToken);
+
         List<ScoredTheme> scored = scoreThemes(fp);
+        if (scored.isEmpty()) {
+            // Don't go silent — fall back to the top common priors so the bot
+            // can still keep guessing while the build is too ambiguous to score.
+            scored = fallbackScanGuesses(fp);
+        }
         lastScannerScores = scored;
 
         if (scored.isEmpty()) {
@@ -843,12 +883,24 @@ public class GTBSolverEngine {
     }
 
     private List<ScoredTheme> scoreThemes(BuildFingerprint fp) {
-        // Restrict scoring to themes whose name overlaps with build tokens, OR have
-        // a curated profile, OR receive a single-block hint, OR are common priors.
+        // Candidate pool — themes whose name overlaps with build tokens, OR have
+        // a curated profile, OR are flagged by a single-block hint, OR are
+        // common priors, OR have historically used at least one of these
+        // tokens (learning-store reverse index).
         Set<String> candidateKeys = new HashSet<>();
+        GTBLearningStore learning = GTBLearningStore.getInstance();
         for (String token : fp.tokens()) {
             Set<String> hits = tokenToThemeKeys.get(token);
             if (hits != null) candidateKeys.addAll(hits);
+            for (String learned : learning.themesForToken(token)) {
+                if (themeKeyToOriginal.containsKey(learned)) candidateKeys.add(learned);
+            }
+            // Curated reverse index: which themes accept this block in their
+            // profile materials list?
+            for (String profileTheme : GTBThemeProfiles.themesAcceptingToken(token)) {
+                String key = profileTheme.toLowerCase(Locale.ROOT);
+                if (themeKeyToOriginal.containsKey(key)) candidateKeys.add(key);
+            }
         }
         for (String hint : fp.singleBlockThemeHints()) {
             String key = hint.toLowerCase(Locale.ROOT);
@@ -902,6 +954,24 @@ public class GTBSolverEngine {
         // 4) Frequency / common-theme priors
         score += COMMON_THEME_PRIORS.getOrDefault(key, 0.0);
         score += PandoraConfig.getInstance().getThemeFrequency(theme) * 0.5;
+
+        // 4b) Learned token affinity: how often this theme used these blocks in
+        // past rounds. Themes that have seen the same tokens before get a boost
+        // proportional to the overlap.
+        GTBLearningStore learning = GTBLearningStore.getInstance();
+        double affinityBonus = 0.0;
+        for (String token : fp.tokens()) {
+            double affinity = learning.tokenAffinity(theme, token);
+            if (affinity > 0.0) {
+                affinityBonus += affinity * Math.min(fp.tokenCount(token), 20) * 0.8;
+            }
+        }
+        // Lightly downweight the bonus until we've seen the theme a few times
+        // so a single fluke round doesn't dominate.
+        int rounds = learning.roundsObserved(theme);
+        if (rounds > 0) {
+            score += affinityBonus * Math.min(1.0, rounds / 3.0);
+        }
 
         // 5) Single-block dominance bonus: tiny build of one signature block
         if (fp.totalBlocks() <= 6 && fp.dominantBlockId() != null) {
@@ -1150,6 +1220,66 @@ public class GTBSolverEngine {
         return text.contains("guess") && text.contains("build");
     }
 
+    /**
+     * Reads the builder's main-hand item if it's a block. Returns the block id
+     * path (e.g. "gold_block") or null if no builder/block could be found.
+     */
+    private String readBuilderHeldBlockToken() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null || client.player == null || plotRegion == null) return null;
+        String ownName = client.player.getName().getString();
+        String builderName = lastBuilderLabel == null ? "" : lastBuilderLabel.trim();
+        net.minecraft.entity.player.PlayerEntity builder = null;
+        for (net.minecraft.entity.player.PlayerEntity p : client.world.getPlayers()) {
+            if (p == client.player) continue;
+            if (p.getName().getString().equalsIgnoreCase(ownName)) continue;
+            // Prefer a name-match against the scoreboard's builder line if we have one.
+            if (!builderName.isEmpty() && p.getName().getString().equalsIgnoreCase(builderName)) {
+                builder = p;
+                break;
+            }
+            // Otherwise fall back to whoever stands inside the plot region.
+            if (plotRegion.contains(p.getBlockPos())) {
+                builder = p;
+            }
+        }
+        if (builder == null) return null;
+        net.minecraft.item.ItemStack held = builder.getMainHandStack();
+        if (held == null || held.isEmpty()) return null;
+        if (!(held.getItem() instanceof net.minecraft.item.BlockItem blockItem)) return null;
+        net.minecraft.util.Identifier id = Registries.BLOCK.getId(blockItem.getBlock());
+        return id == null ? null : id.getPath();
+    }
+
+    /**
+     * When the primary scoring returns nothing, surface a small set of common
+     * priors so the bot still has something to guess. Avoids the "silent bot"
+     * regression where pre-hint scanner finds no match.
+     */
+    private List<ScoredTheme> fallbackScanGuesses(BuildFingerprint fp) {
+        List<ScoredTheme> fallback = new ArrayList<>();
+        PandoraConfig config = PandoraConfig.getInstance();
+        for (Map.Entry<String, Double> e : COMMON_THEME_PRIORS.entrySet()) {
+            String key = e.getKey();
+            String original = themeKeyToOriginal.get(key);
+            if (original == null) continue;
+            double score = e.getValue() + config.getThemeFrequency(original) * 0.3;
+            if (fp != null && fp.dominantBlockId() != null) {
+                // Slight nudge if any token from the build matches the prior theme name.
+                for (String token : GTBBlockSignatures.tokenize(fp.dominantBlockId())) {
+                    if (key.contains(token)) {
+                        score += 1.5;
+                        break;
+                    }
+                }
+            }
+            fallback.add(new ScoredTheme(original, score));
+        }
+        fallback.sort(Comparator.comparingDouble(ScoredTheme::score).reversed());
+        if (fallback.size() > 8) fallback = fallback.subList(0, 8);
+        return fallback;
+    }
+
     private static boolean isWhiteTerracotta(BlockState state) {
         String id = Registries.BLOCK.getId(state.getBlock()).getPath();
         return "white_terracotta".equals(id) || "hardened_clay".equals(id) || "white_stained_hardened_clay".equals(id);
@@ -1270,6 +1400,18 @@ public class GTBSolverEngine {
 
         int tokenCount(String token) {
             return tokenCounts.getOrDefault(token, 0);
+        }
+
+        /**
+         * Records a token from an out-of-band source (e.g. the builder's held
+         * item) so the scoring sees it but it doesn't inflate totalBlocks or
+         * bounding-box stats. Counted as a single occurrence.
+         */
+        void addExtraToken(String token) {
+            if (token == null || token.isBlank()) return;
+            for (String t : GTBBlockSignatures.tokenize(token)) {
+                tokenCounts.merge(t, 1, Integer::sum);
+            }
         }
 
         int blockIdCount(String id) {

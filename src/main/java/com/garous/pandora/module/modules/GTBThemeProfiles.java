@@ -1,6 +1,7 @@
 package com.garous.pandora.module.modules;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -56,12 +57,59 @@ public final class GTBThemeProfiles {
     }
 
     private static final Map<String, Profile> PROFILES = build();
+    // Reverse index: block token (color or material) -> set of theme names whose
+    // profile lists that token. Built once at class-load.
+    private static final Map<String, Set<String>> TOKEN_TO_THEMES = buildReverseIndex(PROFILES);
 
     public static Profile lookup(String themeName) {
         if (themeName == null) {
             return null;
         }
         return PROFILES.get(themeName.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Returns the themes whose profile materials or colors include this token.
+     * Used by the scanner to widen its candidate pool when the build contains a
+     * specific block — e.g. "gold" -> [necklace, ring, trophy, medal, ...].
+     */
+    public static Set<String> themesAcceptingToken(String token) {
+        if (token == null) return Set.of();
+        Set<String> hits = TOKEN_TO_THEMES.get(token.toLowerCase(Locale.ROOT));
+        return hits == null ? Set.of() : hits;
+    }
+
+    private static Map<String, Set<String>> buildReverseIndex(Map<String, Profile> profiles) {
+        Map<String, Set<String>> index = new HashMap<>();
+        for (Map.Entry<String, Profile> entry : profiles.entrySet()) {
+            String theme = entry.getKey();
+            Profile profile = entry.getValue();
+            if (profile == null) continue;
+            for (String color : profile.colors()) {
+                index.computeIfAbsent(color.toLowerCase(Locale.ROOT), k -> new HashSet<>()).add(theme);
+            }
+            for (String material : profile.materials()) {
+                index.computeIfAbsent(material.toLowerCase(Locale.ROOT), k -> new HashSet<>()).add(theme);
+            }
+            if (profile.signatureBlock() != null) {
+                String sig = profile.signatureBlock().toLowerCase(Locale.ROOT);
+                index.computeIfAbsent(sig, k -> new HashSet<>()).add(theme);
+                // Index the trailing token of the signature block id too (e.g.
+                // "minecraft:gold_block" -> "gold_block" and "gold").
+                for (String token : tokenize(sig)) {
+                    index.computeIfAbsent(token, k -> new HashSet<>()).add(theme);
+                }
+            }
+        }
+        return Map.copyOf(index);
+    }
+
+    private static List<String> tokenize(String id) {
+        List<String> tokens = new java.util.ArrayList<>();
+        for (String part : id.replace(':', '_').split("_")) {
+            if (!part.isBlank()) tokens.add(part);
+        }
+        return tokens;
     }
 
     private static Map<String, Profile> build() {

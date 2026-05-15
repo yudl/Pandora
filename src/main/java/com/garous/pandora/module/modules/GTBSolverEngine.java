@@ -408,9 +408,19 @@ public class GTBSolverEngine {
 
     private void loadTranslationData() {
         Set<String> seenThemes = new HashSet<>();
-        try (InputStream stream = getClass().getResourceAsStream("/assets/pandora/translations-data.json")) {
+        loadThemeResource("/assets/pandora/translations-data.json", seenThemes, true);
+        // Themes that were in older versions of GTB but were dropped from the
+        // current bundled list. Loaded so the bot can still guess them if
+        // Hypixel cycles them back in. ~287 extra themes.
+        loadThemeResource("/assets/pandora/translations-extra.json", seenThemes, false);
+        themeWords.sort(String.CASE_INSENSITIVE_ORDER);
+        Pandora.LOGGER.info("[GTBSolver] Loaded {} Guess The Build themes.", themeWords.size());
+    }
+
+    private void loadThemeResource(String path, Set<String> seenThemes, boolean requireResource) {
+        try (InputStream stream = getClass().getResourceAsStream(path)) {
             if (stream == null) {
-                Pandora.LOGGER.error("[GTBSolver] translations-data.json not found in resources.");
+                if (requireResource) Pandora.LOGGER.error("[GTBSolver] {} not found in resources.", path);
                 return;
             }
             JsonArray array = new Gson().fromJson(new InputStreamReader(stream, StandardCharsets.UTF_8), JsonArray.class);
@@ -422,12 +432,10 @@ public class GTBSolverEngine {
                 if (theme.isEmpty()) continue;
                 String key = theme.toLowerCase(Locale.ROOT);
                 if (seenThemes.add(key)) themeWords.add(theme);
-                shortestTranslationMap.put(key, findShortestTranslation(entry, theme));
+                shortestTranslationMap.putIfAbsent(key, findShortestTranslation(entry, theme));
             }
-            themeWords.sort(String.CASE_INSENSITIVE_ORDER);
-            Pandora.LOGGER.info("[GTBSolver] Loaded {} Guess The Build themes.", themeWords.size());
         } catch (Exception exception) {
-            Pandora.LOGGER.error("[GTBSolver] Failed to load translations-data.json.", exception);
+            Pandora.LOGGER.error("[GTBSolver] Failed to load {}.", path, exception);
         }
     }
 
@@ -1001,38 +1009,20 @@ public class GTBSolverEngine {
         // a curated profile, OR are flagged by a single-block hint, OR are
         // common priors, OR have historically used at least one of these
         // tokens (learning-store reverse index).
-        Set<String> candidateKeys = new HashSet<>();
-        GTBLearningStore learning = GTBLearningStore.getInstance();
-        for (String token : fp.tokens()) {
-            Set<String> hits = tokenToThemeKeys.get(token);
-            if (hits != null) candidateKeys.addAll(hits);
-            for (String learned : learning.themesForToken(token)) {
-                if (themeKeyToOriginal.containsKey(learned)) candidateKeys.add(learned);
-            }
-            // Curated reverse index: which themes accept this block in their
-            // profile materials list?
-            for (String profileTheme : GTBThemeProfiles.themesAcceptingToken(token)) {
-                String key = profileTheme.toLowerCase(Locale.ROOT);
-                if (themeKeyToOriginal.containsKey(key)) candidateKeys.add(key);
-            }
-        }
-        for (String hint : fp.singleBlockThemeHints()) {
-            String key = hint.toLowerCase(Locale.ROOT);
-            if (themeKeyToOriginal.containsKey(key)) candidateKeys.add(key);
-        }
-        for (String prior : COMMON_THEME_PRIORS.keySet()) {
-            if (themeKeyToOriginal.containsKey(prior)) candidateKeys.add(prior);
-        }
-
-        List<ScoredTheme> scored = new ArrayList<>(candidateKeys.size());
-        for (String key : candidateKeys) {
-            String original = themeKeyToOriginal.get(key);
-            if (original == null) continue;
+        //
+        // We score EVERY theme in the dictionary - the candidate-pool
+        // pre-filter from previous versions was capping the bot at niche
+        // themes its heuristics had never seen, so 'Diamond Ring' or
+        // 'Ice Skates' could never appear in the result no matter how
+        // strongly the build matched. Scoring all ~1700 themes is fast
+        // enough (constant-time per theme) and the score floor filters
+        // out non-matches.
+        List<ScoredTheme> scored = new ArrayList<>(themeWords.size());
+        for (String original : themeWords) {
             double score = scoreTheme(original, fp);
             if (score >= MIN_SCAN_SCORE) scored.add(new ScoredTheme(original, score));
         }
         scored.sort(Comparator.comparingDouble(ScoredTheme::score).reversed());
-        if (scored.size() > 32) scored = scored.subList(0, 32);
         return scored;
     }
 
